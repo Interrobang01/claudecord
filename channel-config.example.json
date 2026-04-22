@@ -1,0 +1,34 @@
+{
+  "_comment": "Copy this file to channel-config.json and replace placeholder values. This file is hot-reloaded by the bot on save.",
+  "channels": {
+    "YOUR_CHANNEL_ID_HERE": {
+      "name": "general",
+      "sessionId": "general-001",
+      "systemPrompt": "You are a helpful assistant running in Discord via Claude Code. Respond naturally and concisely.",
+      "workingDirectory": "/path/to/your/working/directory",
+      "model": "sonnet",
+      "replyInThread": true,
+      "contextFile": "contexts/general.md"
+    },
+    "ANOTHER_CHANNEL_ID_FOR_A_SCHEDULED_JOB": {
+      "name": "daily-digest",
+      "sessionId": "daily-digest-001",
+      "systemPrompt": "You are a helpful assistant running in Discord via Claude Code.",
+      "workingDirectory": "/path/to/your/working/directory",
+      "model": "sonnet",
+      "replyInThread": true,
+      "contextFile": "contexts/daily-digest.md",
+      "schedule": {
+        "cron": "0 8 * * *",
+        "timezone": "America/Chicago",
+        "useThread": true,
+        "prompt": "Run the daily digest and post a summary to this channel."
+      }
+    }
+  },
+  "defaults": {
+    "model": "sonnet",
+    "systemPrompt": "You are a helpful assistant running in Discord via Claude Code.",
+    "workingDirectory": "/path/to/your/working/directory"
+  }
+}

@@ -1,0 +1,47 @@
+# Dependencies
+node_modules/
+
+# Build
+dist/
+
+# Environment
+.env
+
+# Runtime configs (copy from .example versions and edit locally)
+channel-config.json
+contexts/*.md
+!contexts/*.example.md
+
+# Runtime state
+thread-map.json
+thread-map.json.bak
+threads.db
+threads.db-wal
+threads.db-shm
+tmp-attachments/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Linux
+*~
+.directory
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+npm-debug.log*
