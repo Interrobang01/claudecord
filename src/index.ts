@@ -147,6 +147,10 @@ function hasStoredCredentials(): boolean {
 function childEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env, CLAUDECODE: undefined };
   if (hasStoredCredentials()) env.CLAUDE_CODE_OAUTH_TOKEN = "";
+  // This bot's own bookkeeping is not the agent's business. The bot token in
+  // particular would otherwise be readable from the agent's shell, which is a
+  // credential for the identity it is speaking as.
+  env.DISCORD_TOKEN = "";
   return env;
 }
 
