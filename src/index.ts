@@ -1012,6 +1012,14 @@ client.once(Events.ClientReady, async (c) => {
       body: slashCommands.map(cmd => cmd.toJSON()),
     });
     console.log(`[discord-cc-bot] registered ${slashCommands.length} slash commands`);
+  const configured = Object.entries(channelConfig.channels);
+  console.log(
+    configured.length
+      ? `[discord-cc-bot] ${configured.length} channel(s): ` + configured
+          .map(([cid, c]) => `${c.name}=${cid}${c.requireMention ? " mention" : ""}${c.allowBots ? " bots" : ""}${c.fetchHistory === false ? " nohistory" : ""}${c.disallowedTools?.length ? ` -${c.disallowedTools.length}tools` : ""}`)
+          .join(", ")
+      : "[discord-cc-bot] no channel-config.json — mention-only with defaults",
+  );
   } catch (err) {
     console.error("[discord-cc-bot] failed to register commands:", err);
   }
