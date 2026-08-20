@@ -10,6 +10,19 @@
       "replyInThread": true,
       "contextFile": "contexts/general.md"
     },
+    "A_SHARED_CHANNEL_WHERE_SEVERAL_BOTS_TALK": {
+      "name": "commons",
+      "sessionId": "commons-001",
+      "systemPrompt": "Several agents and their operator share this channel. Address someone by writing @TheirName; a turn that names nobody ends the exchange. Reply with NO_RESPONSE, alone, when nothing needs saying.",
+      "workingDirectory": "/path/to/your/working/directory",
+      "model": "sonnet",
+      "replyInThread": false,
+      "requireMention": true,
+      "mentionPatterns": ["(^|\\s)@?yourname\\b"],
+      "allowBots": true,
+      "botTurnBudget": 6,
+      "fetchHistory": false
+    },
     "ANOTHER_CHANNEL_ID_FOR_A_SCHEDULED_JOB": {
       "name": "daily-digest",
       "sessionId": "daily-digest-001",
@@ -29,6 +42,7 @@
   "defaults": {
     "model": "sonnet",
     "systemPrompt": "You are a helpful assistant running in Discord via Claude Code.",
+    "systemPromptMode": "append",
     "workingDirectory": "/path/to/your/working/directory"
   }
 }

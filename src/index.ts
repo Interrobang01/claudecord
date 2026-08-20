@@ -132,6 +132,34 @@ function getOrCreate(map: ThreadMap, threadId: string, defaultCwd: string): Thre
 
 const CLAUDE_HOME = path.join(process.env.HOME ?? "", ".claude");
 
+// --- Auth / child environment ---
+
+// CLAUDE_CODE_OAUTH_TOKEN short-circuits ~/.claude/.credentials.json inside the
+// CLI's credential resolver, and a token minted by `claude setup-token` declares
+// only `user:inference`. So an inherited token silently strips the scopes a
+// `claude /login` credential carries — `user:mcp_servers` among them, which is
+// what gates claude.ai connectors — and nothing errors: the tool is simply
+// absent. Prefer the stored credential when one exists, and blank the variable
+// for the child so a value from a systemd EnvironmentFile cannot ride in on the
+// `...process.env` spread.
+const CREDENTIALS_PATH = path.join(CLAUDE_HOME, ".credentials.json");
+
+function hasStoredCredentials(): boolean {
+  try {
+    return fs.statSync(CREDENTIALS_PATH).isFile();
+  } catch {
+    return false;
+  }
+}
+
+// Checked per spawn rather than cached, so a `claude /login` run after the
+// process started takes effect without a restart.
+function childEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env, CLAUDECODE: undefined };
+  if (hasStoredCredentials()) env.CLAUDE_CODE_OAUTH_TOKEN = "";
+  return env;
+}
+
 /**
  * Patch session file so CC's /resume picker can discover it.
  * CC 2.1.90+ filters out sessions with entrypoint:"sdk-cli" from the picker.
@@ -353,6 +381,7 @@ function runClaudeStreaming(opts: {
   claudeBin: string;
   resume: boolean;
   systemPrompt?: string;
+  systemPromptMode?: SystemPromptMode;
   mcpConfig?: string;
   timeoutMs?: number;
   callbacks?: StreamCallbacks;
@@ -366,13 +395,18 @@ function runClaudeStreaming(opts: {
       "--output-format", "stream-json",
       "--verbose",
       "--include-partial-messages",
-      ...(opts.systemPrompt ? ["--system-prompt", opts.systemPrompt] : []),
+      // `--system-prompt` REPLACES Claude Code's own system prompt; `--append-`
+      // adds to it. Replacing drops the CLI's tool-use guidance along with
+      // everything else, so append is the default and replacing is opt-in.
+      ...(opts.systemPrompt
+        ? [opts.systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt", opts.systemPrompt]
+        : []),
       ...(opts.mcpConfig ? ["--mcp-config", opts.mcpConfig] : []),
     ];
 
     const child = spawn(opts.claudeBin, args, {
       cwd: opts.cwd,
-      env: { ...process.env, CLAUDECODE: undefined },
+      env: childEnv(),
       stdio: ["ignore", "pipe", "pipe"],
     });
 
@@ -495,7 +529,7 @@ function generateThreadTitle(opts: {
 
     const child = spawn(opts.claudeBin, args, {
       cwd: opts.cwd,
-      env: { ...process.env, CLAUDECODE: undefined },
+      env: childEnv(),
       stdio: ["ignore", "pipe", "pipe"],
     });
 
@@ -867,15 +901,30 @@ type ChannelSchedule = {
   useThread?: boolean;
 };
 
+type SystemPromptMode = "append" | "replace";
+
 type ChannelConfig = {
   name: string;
   sessionId: string;
   systemPrompt?: string;
+  systemPromptMode?: SystemPromptMode;
   workingDirectory?: string;
   model?: string;
   schedule?: ChannelSchedule;
   replyInThread?: boolean;
   contextFile?: string;
+  /** Answer only when mentioned. Default false — a configured channel replies to everything. */
+  requireMention?: boolean;
+  /** Extra case-insensitive regexes counted as a mention, so a bare name in plain
+   *  text routes as well as a real Discord ping does. */
+  mentionPatterns?: string[];
+  /** Admit messages from other bots. Default false. */
+  allowBots?: boolean;
+  /** Consecutive bot-triggered turns allowed before this channel goes quiet
+   *  until a human speaks. Default DEFAULT_BOT_TURN_BUDGET. */
+  botTurnBudget?: number;
+  /** Prepend recent channel messages to the prompt. Default true. */
+  fetchHistory?: boolean;
 };
 
 type ChannelConfigFile = {
@@ -883,6 +932,7 @@ type ChannelConfigFile = {
   defaults?: {
     model?: string;
     systemPrompt?: string;
+    systemPromptMode?: SystemPromptMode;
     workingDirectory?: string;
   };
 };
@@ -949,6 +999,107 @@ function getChannelAgent(channelId: string): ChannelConfig | null {
   return channelConfig.channels[channelId] ?? null;
 }
 
+function resolveSystemPromptMode(agent: ChannelConfig | null): SystemPromptMode {
+  return agent?.systemPromptMode ?? channelConfig.defaults?.systemPromptMode ?? "append";
+}
+
+// A bare name in message text should route as well as a real Discord ping does,
+// because a bot posting plain "@name" does not produce a ping — only the
+// `<@id>` form does, and text written by a model is posted verbatim.
+function matchesMentionPatterns(content: string, agent: ChannelConfig | null): boolean {
+  const patterns = agent?.mentionPatterns;
+  if (!patterns?.length) return false;
+  return patterns.some((pattern) => {
+    try {
+      return new RegExp(pattern, "i").test(content);
+    } catch (err) {
+      console.error(`[discord-cc-bot] bad mentionPattern ${JSON.stringify(pattern)}:`, (err as Error).message);
+      return false;
+    }
+  });
+}
+
+// --- Bot-turn budget ---
+
+// Admitting other bots is what lets two of them hold a conversation, and
+// therefore also what lets them answer each other until something kills the
+// process. Instruction alone has been observed to fail at this — the runaway
+// case is two agents being polite, not two agents misbehaving — so the ceiling
+// is mechanical: N consecutive bot-triggered turns per channel, cleared by any
+// message from a human.
+const DEFAULT_BOT_TURN_BUDGET = 6;
+const botTurnsUsed = new Map<string, number>();
+
+function consumeBotTurnBudget(channelId: string, fromBot: boolean, agent: ChannelConfig | null): boolean {
+  if (!fromBot) {
+    botTurnsUsed.delete(channelId);
+    return true;
+  }
+  const budget = agent?.botTurnBudget ?? DEFAULT_BOT_TURN_BUDGET;
+  const used = (botTurnsUsed.get(channelId) ?? 0) + 1;
+  botTurnsUsed.set(channelId, used);
+  if (used > budget) {
+    console.log(`[discord-cc-bot] bot-turn budget (${budget}) spent in ${channelId} — quiet until a human speaks`);
+    return false;
+  }
+  return true;
+}
+
+// --- Turn serialization ---
+
+// A message arriving mid-turn queues instead of being rejected: with several
+// speakers in one channel, mid-turn arrival is the normal case rather than the
+// exception.
+const MAX_QUEUE_DEPTH = 4;
+
+type Lane = { busy: boolean; waiting: (() => void)[] };
+const lanes = new Map<string, Lane>();
+
+/** Returns a release function, or null if this key's queue is already full. */
+function acquireTurn(key: string): Promise<(() => void) | null> {
+  let lane = lanes.get(key);
+  if (!lane) {
+    lane = { busy: false, waiting: [] };
+    lanes.set(key, lane);
+  }
+  const held = lane;
+
+  if (held.busy && held.waiting.length >= MAX_QUEUE_DEPTH) {
+    return Promise.resolve(null);
+  }
+
+  const makeRelease = (): (() => void) => {
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const next = held.waiting.shift();
+      if (next) {
+        next();
+      } else {
+        held.busy = false;
+        if (lanes.get(key) === held) lanes.delete(key);
+      }
+    };
+  };
+
+  if (!held.busy) {
+    held.busy = true;
+    return Promise.resolve(makeRelease());
+  }
+  return new Promise((resolve) => {
+    held.waiting.push(() => resolve(makeRelease()));
+  });
+}
+
+// --- Silent turns ---
+
+// An explicit way for the model to decline to post. In a channel where bots hear
+// each other, not posting is what ends an exchange, so the graceful exit needs to
+// be something the model can choose rather than something it has to be stopped
+// from doing.
+const SILENT_TOKEN = process.env.SILENT_TOKEN ?? "NO_RESPONSE";
+
 // --- Discord ---
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN!;
@@ -991,6 +1142,13 @@ const client = new Client({
 
 client.once(Events.ClientReady, async (c) => {
   console.log(`[discord-cc-bot] ready as ${c.user.tag}`);
+  console.log(
+    `[discord-cc-bot] auth: ${hasStoredCredentials()
+      ? `stored credentials (${CREDENTIALS_PATH}); CLAUDE_CODE_OAUTH_TOKEN blanked for children`
+      : process.env.CLAUDE_CODE_OAUTH_TOKEN
+        ? "CLAUDE_CODE_OAUTH_TOKEN from the environment"
+        : "none found — the CLI will resolve its own"}`,
+  );
   const rest = new REST().setToken(DISCORD_TOKEN);
   try {
     const route = GUILD_ID
@@ -1023,6 +1181,7 @@ function startScheduledJobs(c: Client<true>): void {
 
     const task = cron.schedule(cronExpr, async () => {
       console.log(`[discord-cc-bot] cron fired for #${cfg.name}`);
+      let release: (() => void) | null = null;
       try {
         const channel = await c.channels.fetch(channelId);
         if (!channel || !("send" in channel)) {
@@ -1066,8 +1225,9 @@ function startScheduledJobs(c: Client<true>): void {
         entry.cwd = agentCwd;
         entry.model = agentModel;
 
-        if (running.has(entry.sessionId)) {
-          console.log(`[discord-cc-bot] cron: #${cfg.name} already running, skipping`);
+        release = await acquireTurn(entry.sessionId);
+        if (!release) {
+          console.log(`[discord-cc-bot] cron: #${cfg.name} session busy, skipping this firing`);
           return;
         }
 
@@ -1084,6 +1244,7 @@ function startScheduledJobs(c: Client<true>): void {
           claudeBin: CLAUDE_BIN,
           resume: entry.started,
           systemPrompt: agentSystemPrompt,
+          systemPromptMode: resolveSystemPromptMode(cfg),
           callbacks: {
             onText: (fullText) => handleStreamText(previewState, fullText),
             onToolUse: createToolUseHandler(previewState),
@@ -1109,6 +1270,8 @@ function startScheduledJobs(c: Client<true>): void {
         console.log(`[discord-cc-bot] cron: #${cfg.name} completed`);
       } catch (err) {
         console.error(`[discord-cc-bot] cron error for #${cfg.name}:`, (err as Error).message);
+      } finally {
+        release?.();
       }
     }, { timezone: timezone ?? undefined });
 
@@ -1518,22 +1681,32 @@ client.on(Events.InteractionCreate, async (interaction) => {
 });
 
 client.on(Events.MessageCreate, async (message) => {
+  let releaseTurn: (() => void) | null = null;
   try {
-    if (message.author.bot) return;
+    // Never react to our own output, whatever the bot policy is.
+    if (message.author.id === client.user!.id) return;
 
     // Check if this is a configured channel (agent routing)
     // Also check parent channel for threads inside configured channels
     const agent = getChannelAgent(message.channelId)
       ?? (message.channel.isThread() ? getChannelAgent(message.channel.parentId!) : null);
-    const isMentioned = message.mentions.has(client.user!.id);
+
+    const fromBot = message.author.bot;
+    if (fromBot && !(agent?.allowBots ?? false)) return;
+
+    const isMentioned = message.mentions.has(client.user!.id)
+      || matchesMentionPatterns(message.content, agent);
 
     if (agent) {
-      // Configured channel (or thread inside one) — respond to all messages
+      // Configured channel (or thread inside one) — everything, unless gated
+      if ((agent.requireMention ?? false) && !isMentioned) return;
     } else if (isMentioned) {
       // @mentioned anywhere — respond with defaults
     } else {
       return;
     }
+
+    if (!consumeBotTurnBudget(message.channelId, fromBot, agent)) return;
 
     const content = message.content.replace(/<@!?\d+>/g, "").trim();
     const attachments = [...message.attachments.values()];
@@ -1598,8 +1771,9 @@ client.on(Events.MessageCreate, async (message) => {
       entry = getOrCreate(threadMap, threadId, DEFAULT_CWD);
     }
 
-    if (running.has(entry.sessionId)) {
-      await message.reply("Previous task still running. Use `/stop` first.");
+    releaseTurn = await acquireTurn(entry.sessionId);
+    if (!releaseTurn) {
+      console.log(`[discord-cc-bot] queue full for ${entry.sessionId} — dropping message ${message.id}`);
       return;
     }
 
@@ -1628,12 +1802,21 @@ client.on(Events.MessageCreate, async (message) => {
 
     try {
       const historyChannel = thread ?? message.channel;
-      const history = await fetchThreadHistory(historyChannel, entry, client.user!.id, message.id);
-      let userMessage = content;
+      // fetchThreadHistory filters only this bot's own messages, so in a channel
+      // shared with sibling bots it pulls their traffic in whether or not this
+      // agent was addressed. Off is the right default for such a channel.
+      const history = (agent?.fetchHistory ?? true)
+        ? await fetchThreadHistory(historyChannel, entry, client.user!.id, message.id)
+        : "";
+      // Once several speakers share a channel the model has no other way to tell
+      // who is talking, and who is talking is the whole of the routing.
+      const speaker = message.member?.displayName ?? message.author.displayName ?? message.author.username;
+      const body = (agent?.allowBots ?? false) ? `[${speaker}] ${content}` : content;
+      let userMessage = body;
       if (filePaths.length === 1) {
-        userMessage = `${content}\n\nThe user attached a file: ${filePaths[0]}`.trim();
+        userMessage = `${body}\n\nThe user attached a file: ${filePaths[0]}`.trim();
       } else if (filePaths.length > 1) {
-        userMessage = `${content}\n\nThe user attached files:\n${filePaths.map((p) => `- ${p}`).join("\n")}`.trim();
+        userMessage = `${body}\n\nThe user attached files:\n${filePaths.map((p) => `- ${p}`).join("\n")}`.trim();
       }
       const prompt = history ? `${history}${userMessage}` : userMessage;
 
@@ -1649,6 +1832,7 @@ client.on(Events.MessageCreate, async (message) => {
         claudeBin: CLAUDE_BIN,
         resume: entry.started,
         systemPrompt,
+        systemPromptMode: resolveSystemPromptMode(agent),
         callbacks: {
           onText: (fullText) => handleStreamText(previewState, fullText),
           onToolUse: createToolUseHandler(previewState),
@@ -1669,6 +1853,7 @@ client.on(Events.MessageCreate, async (message) => {
           claudeBin: CLAUDE_BIN,
           resume: false,
           systemPrompt,
+          systemPromptMode: resolveSystemPromptMode(agent),
           callbacks: {
             onText: (fullText) => handleStreamText(previewState, fullText),
             onToolUse: createToolUseHandler(previewState),
@@ -1686,6 +1871,17 @@ client.on(Events.MessageCreate, async (message) => {
         entry.started = true;
         await sendAskButtons(thread ?? message.channel, threadId, entry, askDenial);
         return; // Wait for button click — handler will resume
+      }
+
+      // The model declined to speak. Post nothing — in a channel where bots hear
+      // each other, silence is what ends the exchange.
+      if (result.text.trim().startsWith(SILENT_TOKEN)) {
+        await previewState.msg!.delete().catch(() => {});
+        entry.started = true;
+        patchSessionEntrypoint(entry.sessionId, entry.cwd);
+        saveEntry(threadId, entry);
+        console.log(`[discord-cc-bot] ${SILENT_TOKEN} in ${threadId} — nothing posted`);
+        return;
       }
 
       const isFirstReply = !entry.started;
@@ -1738,6 +1934,8 @@ client.on(Events.MessageCreate, async (message) => {
     }
   } catch (err) {
     console.error("[discord-cc-bot] handler error:", (err as Error).message);
+  } finally {
+    releaseTurn?.();
   }
 });
 

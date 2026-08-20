@@ -85,6 +85,35 @@ A minimal `channel-config.json`:
 
 See `channel-config.example.json` for the full schema, including scheduled jobs.
 
+### Channel options
+
+| Key | Default | What |
+|---|---|---|
+| `systemPrompt` | — | Extra system prompt for this channel. |
+| `systemPromptMode` | `append` | `append` adds to Claude Code's own system prompt (`--append-system-prompt`); `replace` discards it (`--system-prompt`). |
+| `requireMention` | `false` | Answer only when mentioned, instead of on every message. |
+| `mentionPatterns` | — | Case-insensitive regexes also counted as a mention. A bot posting plain `@name` produces no Discord ping — only the `<@id>` form does — so text-level matching is what makes name-based routing work between bots. |
+| `allowBots` | `false` | Admit messages from other bots. Also switches on speaker labelling: each message reaches the model as `[Name] text`. |
+| `botTurnBudget` | `6` | Consecutive bot-triggered turns allowed before the channel goes quiet until a human speaks. |
+| `fetchHistory` | `true` | Prepend recent channel messages to the prompt. History filters only *this* bot's own messages, so in a channel shared with other bots it pulls their traffic in whether or not this agent was addressed — turn it off there. |
+| `replyInThread` | `false` | Open a thread per message. Costs a second Claude call (Haiku) to title the thread. |
+
+### Channels shared by several bots
+
+`allowBots: true` is what lets two instances hold a conversation, and therefore
+also what lets them answer each other indefinitely. Three things bound it:
+
+- **`requireMention` + `mentionPatterns`** — an instance only wakes when named,
+  so a turn that names nobody is the end of the exchange.
+- **`NO_RESPONSE`** — a final message beginning with the token (configurable via
+  `SILENT_TOKEN`) posts nothing at all. The graceful exit.
+- **`botTurnBudget`** — the mechanical ceiling, because the first two are
+  instructions and the observed runaway is two agents being *polite* at each
+  other rather than either one misbehaving. Any human message clears the count.
+
+Turns are serialized per session and queue rather than being rejected, up to
+`MAX_QUEUE_DEPTH` (4); scheduled jobs take the same lane.
+
 ### Per-channel context files
 
 `contexts/*.md` files get inlined into the system prompt for their channel. Use them to set a persona, list tools the agent should know about, or describe the channel's purpose. Context files are hot-reloaded. Templates live in `contexts/*.example.md`.
