@@ -244,6 +244,7 @@ function runClaudeStreaming(opts: {
   systemPrompt?: string;
   systemPromptMode?: SystemPromptMode;
   maxBudgetUsd?: number;
+  disallowedTools?: string[];
   mcpConfig?: string;
   timeoutMs?: number;
   callbacks?: StreamCallbacks;
@@ -264,6 +265,11 @@ function runClaudeStreaming(opts: {
         ? [opts.systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt", opts.systemPrompt]
         : []),
       ...(opts.maxBudgetUsd ? ["--max-budget-usd", String(opts.maxBudgetUsd)] : []),
+      // Variadic: every bare word after it is taken as another rule. Safe here
+      // because the prompt is passed with -p up front, never positionally. A rule
+      // matching no known tool only warns, so a typo silently grants what it meant
+      // to withhold — check the log after changing this.
+      ...(opts.disallowedTools?.length ? ["--disallowed-tools", ...opts.disallowedTools] : []),
       ...(opts.mcpConfig ? ["--mcp-config", opts.mcpConfig] : []),
     ];
 
@@ -718,6 +724,10 @@ type ChannelConfig = {
   botTurnBudget?: number;
   /** Prepend recent channel messages to the prompt. Default true. */
   fetchHistory?: boolean;
+  /** Withheld from the model via --disallowed-tools. Names, not an allowlist, so a
+   *  tool that becomes available later cannot appear in a turn by surprise; and a
+   *  flag rather than a deny rule, so the schema stays out of the prompt too. */
+  disallowedTools?: string[];
   /** Passed to the CLI as --max-budget-usd, which aborts a turn mid-flight. */
   maxCostUsdPerTurn?: number;
   /** Refuse new turns in this channel once the day's spend reaches this. */
@@ -1072,6 +1082,7 @@ function startScheduledJobs(c: Client<true>): void {
           systemPrompt: agentSystemPrompt,
           systemPromptMode: resolveSystemPromptMode(cfg),
           maxBudgetUsd: cfg.maxCostUsdPerTurn,
+          disallowedTools: cfg.disallowedTools,
           callbacks: {
             onText: (fullText) => handleStreamText(previewState, fullText),
             onToolUse: createToolUseHandler(previewState),
@@ -1483,6 +1494,7 @@ client.on(Events.MessageCreate, async (message) => {
         systemPrompt,
         systemPromptMode: resolveSystemPromptMode(agent),
         maxBudgetUsd: agent?.maxCostUsdPerTurn,
+        disallowedTools: agent?.disallowedTools,
         callbacks: {
           onText: (fullText) => handleStreamText(previewState, fullText),
           onToolUse: createToolUseHandler(previewState),
@@ -1505,6 +1517,7 @@ client.on(Events.MessageCreate, async (message) => {
           systemPrompt,
           systemPromptMode: resolveSystemPromptMode(agent),
           maxBudgetUsd: agent?.maxCostUsdPerTurn,
+          disallowedTools: agent?.disallowedTools,
           callbacks: {
             onText: (fullText) => handleStreamText(previewState, fullText),
             onToolUse: createToolUseHandler(previewState),

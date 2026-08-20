@@ -97,6 +97,7 @@ See `channel-config.example.json` for the full schema, including scheduled jobs.
 | `botTurnBudget` | `6` | Consecutive bot-triggered turns allowed before the channel goes quiet until a human speaks. |
 | `fetchHistory` | `true` | Prepend recent channel messages to the prompt. History filters only *this* bot's own messages, so in a channel shared with other bots it pulls their traffic in whether or not this agent was addressed — turn it off there. |
 | `replyInThread` | `false` | Open a thread per message. Costs a second Claude call (Haiku) to title the thread. |
+| `disallowedTools` | — | Tool names withheld via `--disallowed-tools`. By name rather than by allowlist, so a tool authenticated later cannot appear by surprise; as a flag rather than a deny rule, so the schema stays out of the prompt as well. A rule matching no known tool only warns, so a typo silently grants what it meant to withhold. |
 | `maxCostUsdPerTurn` | — | Passed to the CLI as `--max-budget-usd`; aborts a turn mid-flight. |
 | `maxCostUsdPerDay` | — | Refuse new turns in this channel once the day's spend reaches this. Tracked in memory, so a restart forgives the day. |
 
