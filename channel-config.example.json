@@ -46,5 +46,6 @@
     "systemPrompt": "You are a helpful assistant running in Discord via Claude Code.",
     "systemPromptMode": "append",
     "workingDirectory": "/path/to/your/working/directory"
-  }
+  },
+  "configuredChannelsOnly": false
 }

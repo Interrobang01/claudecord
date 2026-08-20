@@ -746,6 +746,11 @@ type ChannelConfigFile = {
     systemPromptMode?: SystemPromptMode;
     workingDirectory?: string;
   };
+  /** Ignore mentions in channels that have no entry above. Default false, which is
+   *  upstream's behaviour: a mention anywhere the bot can see starts a turn with
+   *  DEFAULT_CWD, the generic prompt, and none of a channel's tool denials or
+   *  budgets. Where the channel list is a containment boundary, set this true. */
+  configuredChannelsOnly?: boolean;
 };
 
 const CHANNEL_CONFIG_PATH = path.join(import.meta.dirname, "..", "channel-config.json");
@@ -1020,6 +1025,7 @@ client.once(Events.ClientReady, async (c) => {
           .join(", ")
       : "[discord-cc-bot] no channel-config.json — mention-only with defaults",
   );
+  console.log(`[discord-cc-bot] unconfigured channels: ${channelConfig.configuredChannelsOnly ? "ignored" : "answer on mention with defaults"}`);
   } catch (err) {
     console.error("[discord-cc-bot] failed to register commands:", err);
   }
@@ -1381,7 +1387,12 @@ client.on(Events.MessageCreate, async (message) => {
       // Configured channel (or thread inside one) — everything, unless gated
       if ((agent.requireMention ?? false) && !isMentioned) return;
     } else if (isMentioned) {
-      // @mentioned anywhere — respond with defaults
+      // @mentioned in a channel with no config. Whether that is a feature or a
+      // hole in a boundary depends on the deployment, so it is a setting.
+      if (channelConfig.configuredChannelsOnly) {
+        console.log(`[discord-cc-bot] mention in unconfigured channel ${message.channelId} — ignored (configuredChannelsOnly)`);
+        return;
+      }
     } else {
       return;
     }

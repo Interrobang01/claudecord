@@ -102,6 +102,12 @@ See `channel-config.example.json` for the full schema, including scheduled jobs.
 | `maxCostUsdPerTurn` | — | Passed to the CLI as `--max-budget-usd`; aborts a turn mid-flight. |
 | `maxCostUsdPerDay` | — | Refuse new turns in this channel once the day's spend reaches this. Tracked in memory, so a restart forgives the day. |
 
+### Top-level options
+
+| Key | Default | What |
+|---|---|---|
+| `configuredChannelsOnly` | `false` | Ignore mentions in channels with no entry in `channels`. Left false, a mention anywhere the bot can see starts a turn with `DEFAULT_CWD`, the generic system prompt, and none of that channel's tool denials or budgets — set it true wherever the channel list is meant to be a boundary. |
+
 ### Channels shared by several bots
 
 `allowBots: true` is what lets two instances hold a conversation, and therefore
