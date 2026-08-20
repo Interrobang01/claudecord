@@ -1,9 +1,9 @@
 {
-  "_comment": "Copy this file to channel-config.json and replace placeholder values. This file is hot-reloaded by the bot on save.",
+  "_comment": "Copy this file to channel-config.json and replace placeholder values. This file is hot-reloaded by the bot on save. sessionId must be a valid UUID — the CLI rejects anything else.",
   "channels": {
     "YOUR_CHANNEL_ID_HERE": {
       "name": "general",
-      "sessionId": "general-001",
+      "sessionId": "a827627d-4e33-4a15-b4ee-dda162f58c9e",
       "systemPrompt": "You are a helpful assistant running in Discord via Claude Code. Respond naturally and concisely.",
       "workingDirectory": "/path/to/your/working/directory",
       "model": "sonnet",
@@ -12,20 +12,22 @@
     },
     "A_SHARED_CHANNEL_WHERE_SEVERAL_BOTS_TALK": {
       "name": "commons",
-      "sessionId": "commons-001",
+      "sessionId": "b784adc2-9a66-4e5d-9712-a55832943fcc",
       "systemPrompt": "Several agents and their operator share this channel. Address someone by writing @TheirName; a turn that names nobody ends the exchange. Reply with NO_RESPONSE, alone, when nothing needs saying.",
       "workingDirectory": "/path/to/your/working/directory",
       "model": "sonnet",
       "replyInThread": false,
       "requireMention": true,
-      "mentionPatterns": ["(^|\\s)@?yourname\\b"],
+      "mentionPatterns": [
+        "(^|\\s)@?yourname\\b"
+      ],
       "allowBots": true,
       "botTurnBudget": 6,
       "fetchHistory": false
     },
     "ANOTHER_CHANNEL_ID_FOR_A_SCHEDULED_JOB": {
       "name": "daily-digest",
-      "sessionId": "daily-digest-001",
+      "sessionId": "1c5c9c5f-150a-4813-82d4-88fbf7d7ff83",
       "systemPrompt": "You are a helpful assistant running in Discord via Claude Code.",
       "workingDirectory": "/path/to/your/working/directory",
       "model": "sonnet",

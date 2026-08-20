@@ -89,6 +89,7 @@ See `channel-config.example.json` for the full schema, including scheduled jobs.
 
 | Key | Default | What |
 |---|---|---|
+| `sessionId` | — | Seeds the channel's first Claude Code session. **Must be a valid UUID** — the CLI rejects anything else. A bad value is warned about at startup. |
 | `systemPrompt` | — | Extra system prompt for this channel. |
 | `systemPromptMode` | `append` | `append` adds to Claude Code's own system prompt (`--append-system-prompt`); `replace` discards it (`--system-prompt`). |
 | `requireMention` | `false` | Answer only when mentioned, instead of on every message. |

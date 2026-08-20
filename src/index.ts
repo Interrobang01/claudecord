@@ -784,6 +784,18 @@ function getContextForChannel(config: ChannelConfig): string {
   return loadContextFile(config.contextFile);
 }
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// `--session-id` must be a valid UUID. A bad one fails only on the channel's
+// very first turn, which is a long way from where it was configured.
+function warnOnBadSessionIds(): void {
+  for (const [cid, cfg] of Object.entries(channelConfig.channels)) {
+    if (!UUID_RE.test(cfg.sessionId)) {
+      console.error(`[discord-cc-bot] channel ${cid} ("${cfg.name}") has sessionId "${cfg.sessionId}", which is not a UUID — its first turn will fail.`);
+    }
+  }
+}
+
 function preloadContextFiles(): void {
   contextFileCache.clear();
   for (const cfg of Object.values(channelConfig.channels)) {
@@ -794,12 +806,14 @@ function preloadContextFiles(): void {
 }
 
 preloadContextFiles();
+warnOnBadSessionIds();
 
 // Watch for config changes and reload
 fs.watchFile(CHANNEL_CONFIG_PATH, { interval: 5000 }, () => {
   console.log("[discord-cc-bot] reloading channel-config.json");
   channelConfig = loadChannelConfig();
   preloadContextFiles();
+  warnOnBadSessionIds();
 });
 
 function getChannelAgent(channelId: string): ChannelConfig | null {
@@ -1233,7 +1247,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const agentCwd = agent?.workingDirectory ?? channelConfig.defaults?.workingDirectory ?? DEFAULT_CWD;
       const entry = getOrCreate(threadMap, threadId, agentCwd);
       // For configured channels, reset to a new session but keep the agent prefix
-      entry.sessionId = agent ? `${agent.sessionId}-${Date.now()}` : crypto.randomUUID();
+      // Always a fresh UUID: --session-id must be one, and appending a timestamp
+      // to the configured id produced a string the CLI rejects. The config's
+      // sessionId seeds a channel's first session only.
+      entry.sessionId = crypto.randomUUID();
       entry.started = false;
       saveEntry(threadId, entry);
       const label = agent ? `**${agent.name}** agent` : "conversation";
