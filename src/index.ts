@@ -8,7 +8,6 @@ import {
   Client, GatewayIntentBits, Events, ChannelType,
   REST, Routes, SlashCommandBuilder,
   ActionRowBuilder, ButtonBuilder, ButtonStyle,
-  StringSelectMenuBuilder, StringSelectMenuOptionBuilder,
   type Message, type Collection, type Snowflake,
   type TextChannel, type AnyThreadChannel,
 } from "discord.js";
@@ -22,7 +21,6 @@ type ThreadEntry = {
   createdAt: number;
   started: boolean;
   lastBotMessageId?: string;
-  isLocalResume?: boolean;
 };
 
 type ThreadMap = Record<string, ThreadEntry>;
@@ -40,12 +38,8 @@ db.exec(`CREATE TABLE IF NOT EXISTS threads (
   model TEXT NOT NULL,
   createdAt INTEGER NOT NULL,
   started INTEGER NOT NULL DEFAULT 0,
-  lastBotMessageId TEXT,
-  isLocalResume INTEGER NOT NULL DEFAULT 0
+  lastBotMessageId TEXT
 )`);
-
-// Migration: add isLocalResume column if missing
-try { db.exec("ALTER TABLE threads ADD COLUMN isLocalResume INTEGER NOT NULL DEFAULT 0"); } catch { /* already exists */ }
 
 // One-time migration from JSON → SQLite
 if (fs.existsSync(JSON_PATH)) {
@@ -71,8 +65,8 @@ if (fs.existsSync(JSON_PATH)) {
 // Prepared statements
 const stmtGet = db.prepare("SELECT * FROM threads WHERE threadId = ?");
 const stmtUpsert = db.prepare(
-  `INSERT OR REPLACE INTO threads (threadId, sessionId, cwd, model, createdAt, started, lastBotMessageId, isLocalResume)
-   VALUES (@threadId, @sessionId, @cwd, @model, @createdAt, @started, @lastBotMessageId, @isLocalResume)`,
+  `INSERT OR REPLACE INTO threads (threadId, sessionId, cwd, model, createdAt, started, lastBotMessageId)
+   VALUES (@threadId, @sessionId, @cwd, @model, @createdAt, @started, @lastBotMessageId)`,
 );
 const stmtAll = db.prepare("SELECT * FROM threads");
 
@@ -84,7 +78,6 @@ function rowToEntry(row: any): ThreadEntry {
     createdAt: row.createdAt,
     started: !!row.started,
     lastBotMessageId: row.lastBotMessageId ?? undefined,
-    isLocalResume: !!row.isLocalResume,
   };
 }
 
@@ -105,7 +98,6 @@ function saveEntry(threadId: string, entry: ThreadEntry): void {
     createdAt: entry.createdAt,
     started: entry.started ? 1 : 0,
     lastBotMessageId: entry.lastBotMessageId ?? null,
-    isLocalResume: entry.isLocalResume ? 1 : 0,
   });
 }
 
@@ -127,8 +119,6 @@ function getOrCreate(map: ThreadMap, threadId: string, defaultCwd: string): Thre
   }
   return map[threadId];
 }
-
-// --- Local Session Discovery ---
 
 const CLAUDE_HOME = path.join(process.env.HOME ?? "", ".claude");
 
@@ -160,122 +150,6 @@ function childEnv(): NodeJS.ProcessEnv {
   return env;
 }
 
-/**
- * Patch session file so CC's /resume picker can discover it.
- * CC 2.1.90+ filters out sessions with entrypoint:"sdk-cli" from the picker.
- * Rewriting to "cli" makes bot sessions visible alongside interactive ones.
- */
-function patchSessionEntrypoint(sessionId: string, cwd: string): void {
-  try {
-    const sanitized = cwd.replace(/[^a-zA-Z0-9]/g, "-");
-    const projectDir = path.join(CLAUDE_HOME, "projects", sanitized);
-    const sessionFile = path.join(projectDir, `${sessionId}.jsonl`);
-    if (!fs.existsSync(sessionFile)) return;
-    const content = fs.readFileSync(sessionFile, "utf8");
-    if (!content.includes('"entrypoint":"sdk-cli"')) return;
-    fs.writeFileSync(sessionFile, content.replaceAll('"entrypoint":"sdk-cli"', '"entrypoint":"cli"'));
-  } catch { /* best-effort */ }
-}
-
-type LocalSession = {
-  sessionId: string;
-  cwd: string;
-  pid?: number;
-  alive: boolean;
-  startedAt?: number;
-  mtime: number;
-  lastPrompt?: string;
-};
-
-function isProcessAlive(pid: number): boolean {
-  try { process.kill(pid, 0); return true; } catch { return false; }
-}
-
-function discoverLocalSessions(): LocalSession[] {
-  const sessions: LocalSession[] = [];
-
-  // Active sessions from PID files — these have reliable CWD
-  const sessionsDir = path.join(CLAUDE_HOME, "sessions");
-  if (fs.existsSync(sessionsDir)) {
-    for (const file of fs.readdirSync(sessionsDir)) {
-      if (!file.endsWith(".json")) continue;
-      try {
-        const data = JSON.parse(fs.readFileSync(path.join(sessionsDir, file), "utf8"));
-        const alive = isProcessAlive(data.pid);
-        // Skip stale PID files (process dead)
-        if (!alive) continue;
-        sessions.push({
-          sessionId: data.sessionId,
-          cwd: data.cwd,
-          pid: data.pid,
-          alive: true,
-          startedAt: data.startedAt,
-          mtime: data.startedAt ?? 0,
-        });
-      } catch { /* skip malformed */ }
-    }
-  }
-
-  // Also check history.jsonl for recent sessions + last prompt per session
-  const historyPath = path.join(CLAUDE_HOME, "history.jsonl");
-  const promptBySession = new Map<string, string>(); // sessionId → last prompt
-  if (fs.existsSync(historyPath)) {
-    const seen = new Set(sessions.map(s => s.sessionId));
-    try {
-      const lines = fs.readFileSync(historyPath, "utf8").trim().split("\n");
-      // Read last 50 lines to get enough prompt context
-      const recent = lines.slice(-50);
-      const bySession = new Map<string, { cwd: string; mtime: number }>();
-      for (const line of recent) {
-        try {
-          const entry = JSON.parse(line);
-          const cwd = entry.cwd || entry.project;
-          if (entry.sessionId) {
-            if (entry.display) {
-              promptBySession.set(entry.sessionId, entry.display);
-            }
-            if (cwd) {
-              bySession.set(entry.sessionId, {
-                cwd,
-                mtime: typeof entry.timestamp === "number" ? entry.timestamp : 0,
-              });
-            }
-          }
-        } catch { /* skip */ }
-      }
-      // Add top 5 unseen sessions
-      const candidates = [...bySession.entries()]
-        .filter(([sid]) => !seen.has(sid))
-        .sort((a, b) => b[1].mtime - a[1].mtime)
-        .slice(0, 5);
-      for (const [sid, info] of candidates) {
-        sessions.push({
-          sessionId: sid,
-          cwd: info.cwd,
-          alive: false,
-          mtime: info.mtime,
-          lastPrompt: promptBySession.get(sid),
-        });
-      }
-    } catch { /* skip */ }
-  }
-
-  // Attach lastPrompt to PID-discovered sessions too
-  for (const s of sessions) {
-    if (!s.lastPrompt && promptBySession.has(s.sessionId)) {
-      s.lastPrompt = promptBySession.get(s.sessionId);
-    }
-  }
-
-  // Sort: alive first, then by mtime descending
-  sessions.sort((a, b) => {
-    if (a.alive !== b.alive) return a.alive ? -1 : 1;
-    return b.mtime - a.mtime;
-  });
-
-  return sessions;
-}
-
 // --- Thread History ---
 
 const SYSTEM_PROMPT = [
@@ -283,19 +157,6 @@ const SYSTEM_PROMPT = [
   "Multiple users may be talking in the same thread.",
   "When thread history is provided, use it as context to understand the conversation so far.",
   "Reply naturally as a participant in the group conversation.",
-  "IMPORTANT: Do NOT output any session handoff summaries, session recaps, bullet-point preambles, or any meta-commentary about previous sessions at the start of your reply.",
-  "Respond directly and immediately to the user's message.",
-  "",
-  "FORMATTING: Discord does NOT render markdown tables. Never use markdown table syntax (| col | col |).",
-  "When comparing items, use bold label + slash-separated attributes on one line per item, e.g.:",
-  "**Opus** — Speed: Slow / Quality: Best / Price: $$$",
-  "**Sonnet** — Speed: Fast / Quality: Good / Price: $$",
-  "**Haiku** — Speed: Fastest / Quality: OK / Price: $",
-].join("\n");
-
-const RESUME_SYSTEM_PROMPT = [
-  "User is continuing this conversation from Discord (mobile).",
-  "This is the same session, just a different interface — respond normally.",
   "IMPORTANT: Do NOT output any session handoff summaries, session recaps, bullet-point preambles, or any meta-commentary about previous sessions at the start of your reply.",
   "Respond directly and immediately to the user's message.",
   "",
@@ -382,6 +243,7 @@ function runClaudeStreaming(opts: {
   resume: boolean;
   systemPrompt?: string;
   systemPromptMode?: SystemPromptMode;
+  maxBudgetUsd?: number;
   mcpConfig?: string;
   timeoutMs?: number;
   callbacks?: StreamCallbacks;
@@ -401,6 +263,7 @@ function runClaudeStreaming(opts: {
       ...(opts.systemPrompt
         ? [opts.systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt", opts.systemPrompt]
         : []),
+      ...(opts.maxBudgetUsd ? ["--max-budget-usd", String(opts.maxBudgetUsd)] : []),
       ...(opts.mcpConfig ? ["--mcp-config", opts.mcpConfig] : []),
     ];
 
@@ -568,6 +431,28 @@ function generateThreadTitle(opts: {
 
 // --- AskUserQuestion button rendering ---
 
+// A button custom ID caps at 100 characters, which a 36-character session UUID
+// plus an option label overflows — and the old scheme put the label *in* the ID,
+// so a long option was silently truncated and the truncated text was sent back
+// to the model as the answer. Two options sharing a prefix became the same
+// button. Keep the answer here and put only a short handle in the ID.
+const ASK_ANSWERS_MAX = 200;
+
+/** token → the answer that button stands for. `null` means the "Other..." button. */
+const askAnswers = new Map<string, { sessionId: string; answer: string | null }>();
+
+function registerAskAnswer(sessionId: string, answer: string | null): string {
+  const token = crypto.randomBytes(8).toString("hex");
+  askAnswers.set(token, { sessionId, answer });
+  // Insertion-ordered, so the first key is the oldest.
+  while (askAnswers.size > ASK_ANSWERS_MAX) {
+    const oldest = askAnswers.keys().next().value;
+    if (oldest === undefined) break;
+    askAnswers.delete(oldest);
+  }
+  return `ask_${token}`;
+}
+
 async function sendAskButtons(
   channel: { send: (opts: any) => Promise<Message> },
   threadId: string,
@@ -579,7 +464,7 @@ async function sendAskButtons(
     for (const opt of q.options.slice(0, 4)) {
       row.addComponents(
         new ButtonBuilder()
-          .setCustomId(`ask_${entry.sessionId}_${opt.label}`.slice(0, 100))
+          .setCustomId(registerAskAnswer(entry.sessionId, opt.label))
           .setLabel(opt.label)
           .setStyle(ButtonStyle.Primary),
       );
@@ -587,7 +472,7 @@ async function sendAskButtons(
     if (q.options.length <= 3) {
       row.addComponents(
         new ButtonBuilder()
-          .setCustomId(`ask_${entry.sessionId}_OTHER`)
+          .setCustomId(registerAskAnswer(entry.sessionId, null))
           .setLabel("Other...")
           .setStyle(ButtonStyle.Secondary),
       );
@@ -625,98 +510,6 @@ async function downloadAttachment(url: string, filepath: string): Promise<void> 
   const buf = Buffer.from(await res.arrayBuffer());
   fs.mkdirSync(path.dirname(filepath), { recursive: true });
   fs.writeFileSync(filepath, buf);
-}
-
-// --- Skill install (vault -> ~/.claude/skills/) ---
-//
-// Claude Code has a built-in "sensitive file" guard on ~/.claude/ paths that
-// blocks Write/Edit tool calls from within a Claude Code session, even with
-// --dangerously-skip-permissions. This bot process isn't subject to that
-// guard, so we expose a direct slash command to copy a skill's source copy
-// into the Claude Code skills dir where it gets auto-loaded.
-//
-// Set VAULT_SKILLS_DIR in your .env to point at the directory that holds your
-// skill markdown files (e.g. an Obsidian vault's Skills/ folder). Defaults to
-// ~/obsidian-vault/Skills. If the directory doesn't exist, /install-skill is
-// effectively a no-op.
-
-const VAULT_SKILLS_DIR =
-  process.env.VAULT_SKILLS_DIR ??
-  path.join(process.env.HOME ?? "", "obsidian-vault", "Skills");
-const CLAUDE_SKILLS_DIR = path.join(process.env.HOME ?? "", ".claude", "skills");
-
-// Frontmatter keys that are meaningful to Claude Code skill loading.
-// Anything else (vault-specific metadata like `type`, `tags`, `related`,
-// `skill_version`, `trigger_conditions`, `technologies`, `source`) is stripped.
-const SKILL_FRONTMATTER_KEYS = new Set(["name", "description", "author", "version", "date"]);
-
-function stripVaultFrontmatter(raw: string): string {
-  if (!raw.startsWith("---\n")) return raw;
-  const end = raw.indexOf("\n---\n", 4);
-  if (end === -1) return raw;
-  const fmRaw = raw.slice(4, end);
-  const body = raw.slice(end + 5);
-
-  const outLines: string[] = [];
-  const lines = fmRaw.split("\n");
-  let i = 0;
-  while (i < lines.length) {
-    const line = lines[i];
-    const m = line.match(/^([A-Za-z_][A-Za-z0-9_]*):\s*(.*)$/);
-    if (!m) {
-      // continuation of previous key (block scalar content or list item) — include if we kept the parent
-      if (outLines.length > 0 && (line.startsWith("  ") || line.startsWith("-"))) {
-        outLines.push(line);
-      }
-      i++;
-      continue;
-    }
-    const key = m[1];
-    const rest = m[2];
-    const keep = SKILL_FRONTMATTER_KEYS.has(key);
-    if (keep) outLines.push(line);
-    // Consume continuation lines (block scalars `|` / `>` or indented list items)
-    if (rest === "|" || rest === ">" || rest === "") {
-      i++;
-      while (i < lines.length && (lines[i].startsWith("  ") || lines[i].startsWith("- ") || lines[i] === "")) {
-        if (keep) outLines.push(lines[i]);
-        i++;
-      }
-    } else {
-      i++;
-    }
-  }
-  return `---\n${outLines.join("\n").replace(/\n+$/, "")}\n---\n${body}`;
-}
-
-function listVaultSkills(): string[] {
-  if (!fs.existsSync(VAULT_SKILLS_DIR)) return [];
-  return fs.readdirSync(VAULT_SKILLS_DIR)
-    .filter(f => f.endsWith(".md"))
-    .map(f => f.replace(/\.md$/, ""))
-    .sort();
-}
-
-function isSkillInstalled(name: string): boolean {
-  return fs.existsSync(path.join(CLAUDE_SKILLS_DIR, name, "SKILL.md"));
-}
-
-function installSkillFromVault(name: string): { ok: true; path: string } | { ok: false; error: string } {
-  // Validate name: kebab-case, no path traversal
-  if (!/^[a-z0-9][a-z0-9-]*[a-z0-9]$/.test(name)) {
-    return { ok: false, error: "Skill name must be kebab-case (lowercase, digits, hyphens)." };
-  }
-  const src = path.join(VAULT_SKILLS_DIR, `${name}.md`);
-  if (!fs.existsSync(src)) {
-    return { ok: false, error: `No vault skill at \`${src}\`.` };
-  }
-  const raw = fs.readFileSync(src, "utf8");
-  const cleaned = stripVaultFrontmatter(raw);
-  const destDir = path.join(CLAUDE_SKILLS_DIR, name);
-  const dest = path.join(destDir, "SKILL.md");
-  fs.mkdirSync(destDir, { recursive: true });
-  fs.writeFileSync(dest, cleaned, "utf8");
-  return { ok: true, path: dest };
 }
 
 // --- Chunked message sending ---
@@ -925,6 +718,10 @@ type ChannelConfig = {
   botTurnBudget?: number;
   /** Prepend recent channel messages to the prompt. Default true. */
   fetchHistory?: boolean;
+  /** Passed to the CLI as --max-budget-usd, which aborts a turn mid-flight. */
+  maxCostUsdPerTurn?: number;
+  /** Refuse new turns in this channel once the day's spend reaches this. */
+  maxCostUsdPerDay?: number;
 };
 
 type ChannelConfigFile = {
@@ -1092,6 +889,40 @@ function acquireTurn(key: string): Promise<(() => void) | null> {
   });
 }
 
+// --- Spend ledger ---
+
+// An agent talked into a loop is a financial problem before it is anything else,
+// so the ceiling is enforced here rather than left to the model to observe.
+// In memory only: a restart forgives the day's spend.
+type Spend = { day: string; usd: number; notified: boolean };
+const spendByChannel = new Map<string, Spend>();
+
+function utcDay(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function recordSpend(channelId: string, usd: number | undefined): void {
+  if (!usd) return;
+  const day = utcDay();
+  const rec = spendByChannel.get(channelId);
+  if (!rec || rec.day !== day) {
+    spendByChannel.set(channelId, { day, usd, notified: false });
+  } else {
+    rec.usd += usd;
+  }
+}
+
+/** True when the channel is out of budget for today; notifies once per day. */
+function overDailyBudget(channelId: string, agent: ChannelConfig | null): { over: boolean; announce: boolean; spent: number; cap: number } {
+  const cap = agent?.maxCostUsdPerDay ?? 0;
+  const rec = spendByChannel.get(channelId);
+  const spent = rec && rec.day === utcDay() ? rec.usd : 0;
+  if (!cap || spent < cap) return { over: false, announce: false, spent, cap };
+  const announce = !!rec && !rec.notified;
+  if (rec) rec.notified = true;
+  return { over: true, announce, spent, cap };
+}
+
 // --- Silent turns ---
 
 // An explicit way for the model to decline to post. In a channel where bots hear
@@ -1118,11 +949,6 @@ const slashCommands = [
   new SlashCommandBuilder().setName("sessions").setDescription("List all active sessions"),
   new SlashCommandBuilder().setName("channels").setDescription("List configured channel agents"),
   new SlashCommandBuilder().setName("reload-config").setDescription("Reload channel-config.json"),
-  new SlashCommandBuilder().setName("resume-local").setDescription("Resume a local terminal Claude Code session")
-    .addStringOption(o => o.setName("session").setDescription("Session ID (auto-detect if omitted)").setRequired(false)),
-  new SlashCommandBuilder().setName("handback").setDescription("Hand session back to terminal"),
-  new SlashCommandBuilder().setName("install-skill").setDescription("Copy a skill from the Obsidian vault into ~/.claude/skills/")
-    .addStringOption(o => o.setName("name").setDescription("Skill name or number from the list (omit to list)").setRequired(false)),
 ];
 
 if (!DISCORD_TOKEN) {
@@ -1245,11 +1071,14 @@ function startScheduledJobs(c: Client<true>): void {
           resume: entry.started,
           systemPrompt: agentSystemPrompt,
           systemPromptMode: resolveSystemPromptMode(cfg),
+          maxBudgetUsd: cfg.maxCostUsdPerTurn,
           callbacks: {
             onText: (fullText) => handleStreamText(previewState, fullText),
             onToolUse: createToolUseHandler(previewState),
           },
         });
+
+        recordSpend(channelId, result.costUsd);
 
         if (previewState.timer) clearTimeout(previewState.timer);
 
@@ -1264,7 +1093,6 @@ function startScheduledJobs(c: Client<true>): void {
         }
 
         entry.lastBotMessageId = botReply.id;
-        patchSessionEntrypoint(entry.sessionId, entry.cwd);
         saveEntry(targetId, entry);
 
         console.log(`[discord-cc-bot] cron: #${cfg.name} completed`);
@@ -1291,13 +1119,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     // AskUserQuestion buttons: ask_<sessionId>_<answer>
     if (id.startsWith("ask_")) {
-      const parts = id.split("_");
-      const sessionId = parts[1];
-      const answer = parts.slice(2).join("_");
+      const pending = askAnswers.get(id.slice(4));
       const threadId = interaction.channelId;
       const entry = threadMap[threadId];
 
-      if (answer === "OTHER") {
+      // The registry is in memory and does not survive a restart. Say so rather
+      // than sending the model an answer nobody chose.
+      if (!pending) {
+        await interaction.update({ content: "⌛ *This prompt expired — ask again.*", components: [] });
+        return;
+      }
+
+      const answer = pending.answer;
+      if (answer === null) {
         await interaction.reply({ content: "Type your answer as a regular message:", ephemeral: true });
         return;
       }
@@ -1344,8 +1178,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
             botReply = await sendChunked(ch, result.text);
           }
           entry.lastBotMessageId = botReply.id;
-          patchSessionEntrypoint(entry.sessionId, entry.cwd);
-          saveEntry(threadId, entry);
+            saveEntry(threadId, entry);
         } catch (err) {
           if (previewState.timer) clearTimeout(previewState.timer);
           if (previewState.msg) await previewState.msg.edit(`Error: ${(err as Error).message}`).catch(() => {});
@@ -1354,45 +1187,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
-    // Test buttons (temporary)
-    if (id.startsWith("test_")) {
-      const choice = id.replace("test_", "");
-      console.log(`[discord-cc-bot] test button: ${choice}`);
-      await interaction.update({
-        content: `✅ **你選了：${choice}**\n\nBot 收到了你的選擇！按鈕互動成功。`,
-        components: [],
-      });
-      return;
-    }
-
-    return;
-  }
-
-  // --- Select menu handler (resume-local session picker) ---
-  if (interaction.isStringSelectMenu() && interaction.customId === "resume_local_select") {
-    const sessionId = interaction.values[0];
-    const threadId = interaction.channelId;
-    const locals = discoverLocalSessions();
-    const picked = locals.find(s => s.sessionId === sessionId);
-    const cwd = picked?.cwd ?? DEFAULT_CWD;
-    const alive = picked?.alive ?? false;
-
-    const entry = getOrCreate(threadMap, threadId, cwd);
-    entry.sessionId = sessionId;
-    entry.cwd = cwd;
-    entry.isLocalResume = true;
-    entry.started = true;
-    saveEntry(threadId, entry);
-
-    const status = alive ? "🟢 terminal still running" : "🔵 inactive";
-    await interaction.update({
-      content:
-        `📱 已接手本地 session \`${sessionId.slice(0, 8)}…\` (${status})\n` +
-        `cwd: \`${cwd}\`\n\n` +
-        (alive ? `> ⚠️ Terminal CC 還在跑。建議先在 terminal 輸入 \`/quit\`。\n` : "") +
-        `> 💻 回到 terminal 後：\`/quit\` → \`claude --continue\``,
-      components: [],
-    });
     return;
   }
 
@@ -1411,9 +1205,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
           "`/sessions` — list all sessions",
           "`/channels` — list configured channel agents",
           "`/reload-config` — reload channel-config.json",
-          "`/resume-local [session]` — resume a local terminal CC session",
-          "`/handback` — hand session back to terminal",
-          "`/install-skill [name]` — install a vault skill into `~/.claude/skills/` (no arg = list)",
         ].join("\n"),
         ephemeral: true,
       });
@@ -1512,7 +1303,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     if (commandName === "sessions") {
       const lines = Object.entries(threadMap).map(
-        ([tid, e]) => `<#${tid}> | ${e.model} | \`${e.cwd}\`${e.isLocalResume ? " 📱" : ""}`,
+        ([tid, e]) => `<#${tid}> | ${e.model} | \`${e.cwd}\``,
       );
       await interaction.reply({
         content: lines.length ? lines.join("\n") : "No sessions.",
@@ -1521,157 +1312,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
-    if (commandName === "resume-local") {
-      if (!interaction.channel?.isThread()) {
-        await interaction.reply({ content: "This command only works in threads.", ephemeral: true });
-        return;
-      }
-      const threadId = interaction.channelId;
-      const explicitId = interaction.options.getString("session");
-
-      if (explicitId) {
-        // Direct resume with explicit session ID
-        const entry = getOrCreate(threadMap, threadId, DEFAULT_CWD);
-        entry.sessionId = explicitId;
-        entry.isLocalResume = true;
-        entry.started = true; // always resume mode for local sessions
-        saveEntry(threadId, entry);
-        await interaction.reply(
-          `📱 已接手本地 session \`${explicitId.slice(0, 8)}…\`\ncwd: \`${entry.cwd}\`\n\n` +
-          `> 💻 回到 terminal 後：\`/quit\` → \`claude --continue\``,
-        );
-        return;
-      }
-
-      // Auto-discover local sessions
-      const locals = discoverLocalSessions();
-      if (locals.length === 0) {
-        await interaction.reply({ content: "No local sessions found.", ephemeral: true });
-        return;
-      }
-
-      // Filter: only sessions that are NOT alive (can't resume a running session)
-      const resumable = locals.filter(s => !s.alive);
-      const aliveCount = locals.length - resumable.length;
-
-      if (resumable.length === 0) {
-        const hint = aliveCount > 0
-          ? `Found ${aliveCount} active session(s), but can't resume a running CC.\n` +
-            `請先在 terminal 輸入 \`/quit\` 退出，再回來 \`/resume-local\`。`
-          : "No local sessions found.";
-        await interaction.reply({ content: hint, ephemeral: true });
-        return;
-      }
-
-      if (resumable.length === 1) {
-        const s = resumable[0];
-        const entry = getOrCreate(threadMap, threadId, s.cwd);
-        entry.sessionId = s.sessionId;
-        entry.cwd = s.cwd;
-        entry.isLocalResume = true;
-        entry.started = true;
-        saveEntry(threadId, entry);
-        const promptHint = s.lastPrompt ? `\nLast prompt: *${s.lastPrompt.slice(0, 100)}*\n` : "\n";
-        await interaction.reply(
-          `📱 已接手本地 session \`${s.sessionId.slice(0, 8)}…\`` +
-          promptHint +
-          `cwd: \`${s.cwd}\`\n\n` +
-          (aliveCount > 0 ? `> ⚠️ 另有 ${aliveCount} 個活躍 session 無法 resume（需先在 terminal \`/quit\`）\n` : "") +
-          `> 💻 回到 terminal 後：\`claude --continue\``,
-        );
-        return;
-      }
-
-      // Multiple resumable sessions — show select menu
-      const menu = new StringSelectMenuBuilder()
-        .setCustomId("resume_local_select")
-        .setPlaceholder("Pick a session to resume")
-        .addOptions(
-          resumable.slice(0, 10).map((s) => {
-            const ago = Math.round((Date.now() - s.mtime) / 60000);
-            const timeStr = ago < 60 ? `${ago}m` : `${Math.round(ago / 60)}h`;
-            const prompt = s.lastPrompt ?? "(no prompt)";
-            // Label: last prompt (max 100 chars, Discord limit)
-            const label = `${prompt.slice(0, 95)}`;
-            // Description: time ago + cwd
-            const project = s.cwd.split("/").slice(-2).join("/");
-            const desc = `${timeStr} ago · ${project}`;
-            return new StringSelectMenuOptionBuilder()
-              .setLabel(label.slice(0, 100) || "(empty)")
-              .setDescription(desc.slice(0, 100))
-              .setValue(s.sessionId);
-          }),
-        );
-
-      const row = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu);
-      await interaction.reply({ content: "Select a local session to resume:", components: [row], ephemeral: true });
-      return;
-    }
-
-    if (commandName === "install-skill") {
-      const input = interaction.options.getString("name", false);
-      const skills = listVaultSkills();
-      if (skills.length === 0) {
-        await interaction.reply({ content: `No skills found in \`${VAULT_SKILLS_DIR}\`.`, ephemeral: true });
-        return;
-      }
-      if (!input) {
-        // List mode: numbered list with install status
-        const lines = skills.map((s, i) => `**${i + 1}.** ${isSkillInstalled(s) ? "✅" : "⬜"} \`${s}\``);
-        await interaction.reply({
-          content: `**Vault skills** (✅ = installed in \`~/.claude/skills/\`)\n${lines.join("\n")}\n\nRun \`/install-skill <number>\` or \`/install-skill <name>\` to install one.`,
-          ephemeral: true,
-        });
-        return;
-      }
-      // Resolve input: number (1-indexed) or exact name
-      let name = input.trim();
-      if (/^\d+$/.test(name)) {
-        const idx = parseInt(name, 10) - 1;
-        if (idx < 0 || idx >= skills.length) {
-          await interaction.reply({ content: `❌ Number out of range. There are ${skills.length} vault skills (1–${skills.length}).`, ephemeral: true });
-          return;
-        }
-        name = skills[idx];
-      }
-      const result = installSkillFromVault(name);
-      if (!result.ok) {
-        await interaction.reply({ content: `❌ ${result.error}`, ephemeral: true });
-        return;
-      }
-      await interaction.reply({
-        content: `✅ Installed \`${name}\` → \`${result.path}\`\nNew Claude Code sessions will auto-load it.`,
-        ephemeral: true,
-      });
-      return;
-    }
-
-    if (commandName === "handback") {
-      if (!interaction.channel?.isThread()) {
-        await interaction.reply({ content: "This command only works in threads.", ephemeral: true });
-        return;
-      }
-      const threadId = interaction.channelId;
-      const entry = threadMap[threadId];
-      if (!entry?.isLocalResume) {
-        await interaction.reply({ content: "This thread is not a resumed local session.", ephemeral: true });
-        return;
-      }
-      // Kill any running process
-      if (running.has(entry.sessionId)) {
-        running.get(entry.sessionId)!.kill("SIGTERM");
-      }
-      // Reset to a fresh bot session
-      entry.isLocalResume = false;
-      entry.sessionId = crypto.randomUUID();
-      entry.started = false;
-      saveEntry(threadId, entry);
-      await interaction.reply(
-        `💻 已交還 session。回到 terminal 輸入 \`claude --continue\` 即可看到完整對話。\n` +
-        `此 thread 已重置，下次訊息會開始新的 bot session。`,
-      );
-      return;
-    }
   } catch (err) {
     console.error("[discord-cc-bot] interaction error:", (err as Error).message);
     if (!interaction.replied) {
@@ -1707,6 +1347,15 @@ client.on(Events.MessageCreate, async (message) => {
     }
 
     if (!consumeBotTurnBudget(message.channelId, fromBot, agent)) return;
+
+    const budget = overDailyBudget(message.channelId, agent);
+    if (budget.over) {
+      console.log(`[discord-cc-bot] daily budget spent in ${message.channelId}: $${budget.spent.toFixed(2)} of $${budget.cap.toFixed(2)}`);
+      if (budget.announce) {
+        await message.reply(`💸 *Daily budget reached ($${budget.spent.toFixed(2)} of $${budget.cap.toFixed(2)}). Quiet until UTC midnight.*`).catch(() => {});
+      }
+      return;
+    }
 
     const content = message.content.replace(/<@!?\d+>/g, "").trim();
     const attachments = [...message.attachments.values()];
@@ -1822,7 +1471,7 @@ client.on(Events.MessageCreate, async (message) => {
 
       const systemPrompt = agent
         ? agentSystemPrompt
-        : entry.isLocalResume ? RESUME_SYSTEM_PROMPT : SYSTEM_PROMPT;
+        : SYSTEM_PROMPT;
 
       let result = await runClaudeStreaming({
         sessionId: entry.sessionId,
@@ -1833,6 +1482,7 @@ client.on(Events.MessageCreate, async (message) => {
         resume: entry.started,
         systemPrompt,
         systemPromptMode: resolveSystemPromptMode(agent),
+        maxBudgetUsd: agent?.maxCostUsdPerTurn,
         callbacks: {
           onText: (fullText) => handleStreamText(previewState, fullText),
           onToolUse: createToolUseHandler(previewState),
@@ -1854,12 +1504,15 @@ client.on(Events.MessageCreate, async (message) => {
           resume: false,
           systemPrompt,
           systemPromptMode: resolveSystemPromptMode(agent),
+          maxBudgetUsd: agent?.maxCostUsdPerTurn,
           callbacks: {
             onText: (fullText) => handleStreamText(previewState, fullText),
             onToolUse: createToolUseHandler(previewState),
           },
         });
       }
+
+      recordSpend(message.channelId, result.costUsd);
 
       // Cancel any pending throttle timer
       if (previewState.timer) clearTimeout(previewState.timer);
@@ -1878,7 +1531,6 @@ client.on(Events.MessageCreate, async (message) => {
       if (result.text.trim().startsWith(SILENT_TOKEN)) {
         await previewState.msg!.delete().catch(() => {});
         entry.started = true;
-        patchSessionEntrypoint(entry.sessionId, entry.cwd);
         saveEntry(threadId, entry);
         console.log(`[discord-cc-bot] ${SILENT_TOKEN} in ${threadId} — nothing posted`);
         return;
@@ -1889,10 +1541,7 @@ client.on(Events.MessageCreate, async (message) => {
         entry.started = true;
       }
 
-      const disclosure = (isFirstReply && !entry.isLocalResume)
-        ? "*I'm Claude, an AI assistant by Anthropic.*\n\n"
-        : "";
-      const responseText = `${disclosure}${result.text}`;
+      const responseText = result.text;
 
       // Final delivery — always delete preview and send new message
       // so Discord sends a push notification for the completed reply.
@@ -1920,7 +1569,6 @@ client.on(Events.MessageCreate, async (message) => {
       }
 
       entry.lastBotMessageId = botReply.id;
-      patchSessionEntrypoint(entry.sessionId, entry.cwd);
       saveEntry(threadId, entry);
     } catch (err) {
       if (previewState.timer) clearTimeout(previewState.timer);

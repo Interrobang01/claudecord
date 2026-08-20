@@ -12,10 +12,10 @@ Drop claudecord into a Discord server and every channel can become its own Claud
 - **File attachments** — images, code, PDFs, or any file — auto-downloaded and passed to Claude Code's Read tool.
 - **Streaming preview** — real-time response preview with tool-use status line while Claude is working.
 - **Interactive permission buttons** — AskUserQuestion prompts rendered as Discord buttons.
-- **Terminal takeover** — resume any bot session from your terminal via `claude --resume <id>`. Same brain, two entry points.
-- **Reverse takeover** — `/resume-local` picks up a terminal CC session from Discord (mobile use case); `/handback` returns it.
+- **Multi-bot channels** — several instances can share a channel, route to each other by name, and be stopped from looping.
+- **Spend ceilings** — per-turn and per-day dollar caps.
 - **SQLite storage** — crash-safe session persistence with WAL mode.
-- **Slash commands** — `/new`, `/model`, `/cd`, `/stop`, `/channels`, `/reload-config`, `/sessions`, `/resume-local`, `/handback`, `/help`.
+- **Slash commands** — `/new`, `/model`, `/cd`, `/stop`, `/channels`, `/reload-config`, `/sessions`, `/help`.
 
 ## Quick Start
 
@@ -97,6 +97,8 @@ See `channel-config.example.json` for the full schema, including scheduled jobs.
 | `botTurnBudget` | `6` | Consecutive bot-triggered turns allowed before the channel goes quiet until a human speaks. |
 | `fetchHistory` | `true` | Prepend recent channel messages to the prompt. History filters only *this* bot's own messages, so in a channel shared with other bots it pulls their traffic in whether or not this agent was addressed — turn it off there. |
 | `replyInThread` | `false` | Open a thread per message. Costs a second Claude call (Haiku) to title the thread. |
+| `maxCostUsdPerTurn` | — | Passed to the CLI as `--max-budget-usd`; aborts a turn mid-flight. |
+| `maxCostUsdPerDay` | — | Refuse new turns in this channel once the day's spend reaches this. Tracked in memory, so a restart forgives the day. |
 
 ### Channels shared by several bots
 
@@ -169,7 +171,7 @@ message  ───────────►     route by channel ID
 reply / .txt attachment
 ```
 
-Single-file architecture: `src/index.ts` (~1700 LOC). Session state lives in a SQLite DB (`threads.db` with WAL mode) mapping Discord channel/thread IDs to Claude Code session UUIDs.
+Single-file architecture: `src/index.ts` (~1500 LOC). Session state lives in a SQLite DB (`threads.db` with WAL mode) mapping Discord channel/thread IDs to Claude Code session UUIDs.
 
 ## Slash commands
 
@@ -183,38 +185,6 @@ Single-file architecture: `src/index.ts` (~1700 LOC). Session state lives in a S
 | `/channels` | List configured channels |
 | `/reload-config` | Hot-reload `channel-config.json` |
 | `/sessions` | List all active sessions |
-| `/resume-local [session]` | Resume a local terminal CC session |
-| `/handback` | Hand a session back to the terminal |
-
-## Advanced: terminal takeover
-
-Each bot session is a standard Claude Code session. Resume any of them from the terminal:
-
-```bash
-# find the session ID
-sqlite3 threads.db "SELECT sessionId FROM threads WHERE threadId = '<channel-or-thread-id>'"
-
-# resume interactively
-claude --resume <session-id>
-```
-
-Same "brain" — Claude remembers everything from Discord. You get the full interactive experience (diffs, permission confirmations, tool use) in the terminal while Discord stays as-is.
-
-**Use case:** start a task from Discord on your phone → walk to your desk → finish in terminal → report back in Discord. One session, two entry points.
-
-## Reverse takeover: resume terminal from Discord
-
-```
-Terminal: /quit           ← exit Claude Code
-Discord:  /resume-local   ← bot discovers your session, shows a picker
-Discord:  @bot message    ← continue from your phone
-Discord:  /handback       ← when done, hand it back
-Terminal: claude --continue
-```
-
-The bot auto-discovers sessions from `~/.claude/sessions/` (active PIDs) and `~/.claude/history.jsonl` (recent sessions). The select menu shows the last prompt for each session.
-
-> You must `/quit` Claude Code in the terminal before resuming from Discord — Claude Code does not allow two processes to resume the same active session.
 
 ## Origin
 

@@ -10,7 +10,7 @@ project-level orientation. It's public-safe — no secrets, no personal paths.
 ## Project Overview
 
 - **Stack:** TypeScript, Node.js, discord.js, better-sqlite3
-- **Entry point:** `src/index.ts` (single-file architecture, ~1700 LOC)
+- **Entry point:** `src/index.ts` (single-file architecture, ~1500 LOC)
 - **Origin:** fork of [fredchu/discord-claude-code-bot](https://github.com/fredchu/discord-claude-code-bot),
   extended with channel-based multi-agent routing, scheduled jobs, file attachments,
   streaming previews, and hot-reloaded context files.
@@ -55,8 +55,8 @@ Discord message → Channel Router → claude -p "..." --resume <sessionId> → 
 - Sessions are identified by UUID (threads) or stable config ID (channels)
 - `--resume <sessionId>` maintains context across messages
 - `/new` resets the session (generates new ID for threads, appends timestamp for channels)
-- Session files are patched to rewrite `entrypoint` from `sdk-cli` to `cli` so they
-  appear in Claude Code's `/resume` picker
+- Spend is capped per turn (`maxCostUsdPerTurn` → `--max-budget-usd`) and per UTC day
+  (`maxCostUsdPerDay`, tracked in memory)
 
 ## Running the Bot (pm2)
 
@@ -115,7 +115,7 @@ pm2 restart claudecord
 
 ## Slash Commands
 
-`/new`, `/stop`, `/model`, `/cd`, `/channels`, `/reload-config`, `/sessions`, `/resume-local`, `/handback`, `/help`
+`/new`, `/stop`, `/model`, `/cd`, `/channels`, `/reload-config`, `/sessions`, `/help`
 
 ## Code Style
 
