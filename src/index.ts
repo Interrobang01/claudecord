@@ -101,14 +101,14 @@ function saveEntry(threadId: string, entry: ThreadEntry): void {
   });
 }
 
-function getOrCreate(map: ThreadMap, threadId: string, defaultCwd: string): ThreadEntry {
+function getOrCreate(map: ThreadMap, threadId: string, defaultCwd: string, seedSessionId?: string): ThreadEntry {
   if (!map[threadId]) {
     const row = stmtGet.get(threadId) as any;
     if (row) {
       map[threadId] = rowToEntry(row);
     } else {
       map[threadId] = {
-        sessionId: crypto.randomUUID(),
+        sessionId: seedSessionId ?? crypto.randomUUID(),
         cwd: defaultCwd,
         model: "opus",
         createdAt: Date.now(),
@@ -728,6 +728,10 @@ type ChannelConfig = {
   botTurnBudget?: number;
   /** Prepend recent channel messages to the prompt. Default true. */
   fetchHistory?: boolean;
+  /** Channels sharing a group share one Claude Code session, so a conversation can
+   *  move between rooms without starting over. Give them the same `sessionId` too;
+   *  otherwise whichever room speaks first seeds the group. */
+  sessionGroup?: string;
   /** Withheld from the model via --disallowed-tools. Names, not an allowlist, so a
    *  tool that becomes available later cannot appear in a turn by surprise; and a
    *  flag rather than a deny rule, so the schema stays out of the prompt too. */
@@ -798,9 +802,19 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 // `--session-id` must be a valid UUID. A bad one fails only on the channel's
 // very first turn, which is a long way from where it was configured.
 function warnOnBadSessionIds(): void {
+  const groups = new Map<string, Set<string>>();
   for (const [cid, cfg] of Object.entries(channelConfig.channels)) {
     if (!UUID_RE.test(cfg.sessionId)) {
       console.error(`[discord-cc-bot] channel ${cid} ("${cfg.name}") has sessionId "${cfg.sessionId}", which is not a UUID — its first turn will fail.`);
+    }
+    if (cfg.sessionGroup) {
+      if (!groups.has(cfg.sessionGroup)) groups.set(cfg.sessionGroup, new Set());
+      groups.get(cfg.sessionGroup)!.add(cfg.sessionId);
+    }
+  }
+  for (const [name, ids] of groups) {
+    if (ids.size > 1) {
+      console.error(`[discord-cc-bot] sessionGroup "${name}" spans ${ids.size} different sessionIds — whichever channel speaks first seeds the group and the rest are ignored.`);
     }
   }
 }
@@ -827,6 +841,16 @@ fs.watchFile(CHANNEL_CONFIG_PATH, { interval: 5000 }, () => {
 
 function getChannelAgent(channelId: string): ChannelConfig | null {
   return channelConfig.channels[channelId] ?? null;
+}
+
+// Which row a turn's session lives under. Channels sharing a `sessionGroup` share
+// one session: an agent working in the commons can ask for a confirmation on its
+// private channel and the same session sees the answer, which is what keeps the
+// private channel meaningful instead of merely quieter. Threads always get their
+// own session — grouping is about rooms, not about spawned side-conversations.
+function sessionKey(channelId: string, agent: ChannelConfig | null, isThread: boolean): string {
+  if (isThread) return channelId;
+  return agent?.sessionGroup ? `group:${agent.sessionGroup}` : channelId;
 }
 
 function resolveSystemPromptMode(agent: ChannelConfig | null): SystemPromptMode {
@@ -1021,7 +1045,7 @@ client.once(Events.ClientReady, async (c) => {
   console.log(
     configured.length
       ? `[discord-cc-bot] ${configured.length} channel(s): ` + configured
-          .map(([cid, c]) => `${c.name}=${cid}${c.requireMention ? " mention" : ""}${c.allowBots ? " bots" : ""}${c.fetchHistory === false ? " nohistory" : ""}${c.disallowedTools?.length ? ` -${c.disallowedTools.length}tools` : ""}`)
+          .map(([cid, c]) => `${c.name}=${cid}${c.sessionGroup ? ` group:${c.sessionGroup}` : ""}${c.requireMention ? " mention" : ""}${c.allowBots ? " bots" : ""}${c.fetchHistory === false ? " nohistory" : ""}${c.disallowedTools?.length ? ` -${c.disallowedTools.length}tools` : ""}`)
           .join(", ")
       : "[discord-cc-bot] no channel-config.json — mention-only with defaults",
   );
@@ -1089,7 +1113,7 @@ function startScheduledJobs(c: Client<true>): void {
         }
 
         const targetId = threadId ?? channelId;
-        const entry = getOrCreate(threadMap, targetId, agentCwd);
+        const entry = getOrCreate(threadMap, targetId, agentCwd, threadId ? undefined : cfg.sessionId);
         entry.cwd = agentCwd;
         entry.model = agentModel;
 
@@ -1163,7 +1187,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
     // AskUserQuestion buttons: ask_<sessionId>_<answer>
     if (id.startsWith("ask_")) {
       const pending = askAnswers.get(id.slice(4));
-      const threadId = interaction.channelId;
+      const threadId = sessionKey(
+        interaction.channelId,
+        getChannelAgent(interaction.channelId),
+        interaction.channel?.isThread() ?? false,
+      );
       const entry = threadMap[threadId];
 
       // The registry is in memory and does not survive a restart. Say so rather
@@ -1261,7 +1289,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await interaction.reply({ content: "This command only works in threads or configured channels.", ephemeral: true });
         return;
       }
-      const threadId = channelId;
+      const threadId = sessionKey(channelId, agent, interaction.channel?.isThread() ?? false);
       const agentCwd = agent?.workingDirectory ?? channelConfig.defaults?.workingDirectory ?? DEFAULT_CWD;
       const entry = getOrCreate(threadMap, threadId, agentCwd);
       // For configured channels, reset to a new session but keep the agent prefix
@@ -1282,7 +1310,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await interaction.reply({ content: "This command only works in threads.", ephemeral: true });
         return;
       }
-      const threadId = interaction.channelId;
+      const threadId = sessionKey(interaction.channelId, getChannelAgent(interaction.channelId), interaction.channel?.isThread() ?? false);
       const entry = getOrCreate(threadMap, threadId, DEFAULT_CWD);
       entry.model = name;
       saveEntry(threadId, entry);
@@ -1315,7 +1343,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await interaction.reply({ content: "This command only works in threads or configured channels.", ephemeral: true });
         return;
       }
-      const threadId = channelId;
+      const threadId = sessionKey(channelId, agent, interaction.channel?.isThread() ?? false);
       const entry = threadMap[threadId];
       if (entry && running.has(entry.sessionId)) {
         running.get(entry.sessionId)!.kill("SIGTERM");
@@ -1349,7 +1377,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     if (commandName === "sessions") {
       const lines = Object.entries(threadMap).map(
-        ([tid, e]) => `<#${tid}> | ${e.model} | \`${e.cwd}\``,
+        ([tid, e]) => `${tid.startsWith("group:") ? `**${tid.slice(6)}** (group)` : `<#${tid}>`} | ${e.model} | \`${e.cwd}\``,
       );
       await interaction.reply({
         content: lines.length ? lines.join("\n") : "No sessions.",
@@ -1442,7 +1470,9 @@ client.on(Events.MessageCreate, async (message) => {
       })();
     }
 
-    const threadId = thread?.id ?? message.channelId;
+    const threadId = thread
+      ? thread.id
+      : sessionKey(message.channelId, agent, message.channel.isThread());
 
     // For configured channels, use the channel's config for cwd/model/sessionId
     const agentCwd = agent?.workingDirectory ?? channelConfig.defaults?.workingDirectory ?? DEFAULT_CWD;
@@ -1455,18 +1485,11 @@ client.on(Events.MessageCreate, async (message) => {
 
     let entry: ThreadEntry;
     if (agent) {
-      entry = getOrCreate(threadMap, threadId, agentCwd);
+      // A thread spawned from a configured channel is its own conversation and
+      // gets a fresh id; the channel itself starts from the configured one.
+      entry = getOrCreate(threadMap, threadId, agentCwd, thread ? undefined : agent.sessionId);
       entry.cwd = agentCwd;
       entry.model = agentModel;
-      // Thread-first threads get their own session (new UUID from getOrCreate).
-      // Only the parent channel itself gets the stable config sessionId.
-      if (!thread) {
-        const existingRow = stmtGet.get(threadId) as any;
-        if (!existingRow) {
-          entry.sessionId = agent.sessionId;
-          saveEntry(threadId, entry);
-        }
-      }
     } else {
       entry = getOrCreate(threadMap, threadId, DEFAULT_CWD);
     }

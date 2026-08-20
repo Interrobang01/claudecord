@@ -92,6 +92,7 @@ See `channel-config.example.json` for the full schema, including scheduled jobs.
 | `sessionId` | — | Seeds the channel's first Claude Code session. **Must be a valid UUID** — the CLI rejects anything else. A bad value is warned about at startup. |
 | `systemPrompt` | — | Extra system prompt for this channel. |
 | `systemPromptMode` | `append` | `append` adds to Claude Code's own system prompt (`--append-system-prompt`); `replace` discards it (`--system-prompt`). |
+| `sessionGroup` | — | Channels sharing a group share one Claude Code session, so a conversation can move between rooms without starting over. Give them the same `sessionId` too. Threads spawned from a grouped channel still get their own session. |
 | `requireMention` | `false` | Answer only when mentioned, instead of on every message. |
 | `mentionPatterns` | — | Case-insensitive regexes also counted as a mention. A bot posting plain `@name` produces no Discord ping — only the `<@id>` form does — so text-level matching is what makes name-based routing work between bots. |
 | `allowBots` | `false` | Admit messages from other bots. Also switches on speaker labelling: each message reaches the model as `[Name] text`. |
