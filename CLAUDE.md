@@ -24,6 +24,12 @@ Discord message → Channel Router → claude -p "..." --resume <sessionId> → 
 - **Thread mode (original):** Responds in threads when @mentioned. Each thread gets its own session.
 - **Channel mode (added):** Configured channels in `channel-config.json` respond to all messages.
   Each channel maps to a stable Claude Code session with its own cwd, model, and system prompt.
+  `requireMention` narrows a configured channel to mentions only without giving up its
+  system prompt or context file.
+- **Multi-bot channels:** `allowBots` admits other bots so several instances can talk in one
+  channel. Routing is by name (`mentionPatterns`, since a bot posting plain `@name` produces
+  no Discord ping), the graceful exit is a `NO_RESPONSE` reply, and `botTurnBudget` is the
+  mechanical ceiling on a runaway exchange.
 
 ### Key Components (all in src/index.ts)
 
@@ -36,6 +42,13 @@ Discord message → Channel Router → claude -p "..." --resume <sessionId> → 
 - **Preview system:** Posts "thinking..." message, edits it with streaming partial
   results, then replaces with final chunked response.
 - **AskUserQuestion:** Claude's permission denials are rendered as Discord buttons.
+- **childEnv():** Builds the environment for every spawned `claude`. Prefers
+  `~/.claude/.credentials.json` and blanks `CLAUDE_CODE_OAUTH_TOKEN`, because the env token
+  short-circuits the credentials file in the CLI's resolver and declares only
+  `user:inference` — an inherited token silently strips scopes with no error anywhere.
+- **acquireTurn():** Per-session lane. Mid-turn messages queue (depth 4) rather than being
+  rejected; scheduled jobs take the same lane, since `running` is only populated once a
+  child has actually spawned.
 
 ### Session Management
 
@@ -93,7 +106,8 @@ pm2 restart claudecord
 
 ## Configuration
 
-- `.env` — `DISCORD_TOKEN`, `GUILD_ID` (optional), `DEFAULT_CWD` (optional), `CLAUDE_BIN` (optional)
+- `.env` — `DISCORD_TOKEN`, `GUILD_ID` (optional), `DEFAULT_CWD` (optional), `CLAUDE_BIN` (optional),
+  `SILENT_TOKEN` (optional, defaults to `NO_RESPONSE`)
 - `channel-config.json` — Channel-to-agent routing. Copy from `channel-config.example.json`
   and fill in real channel IDs.
 - `contexts/*.md` — Per-channel context files loaded into the system prompt.
