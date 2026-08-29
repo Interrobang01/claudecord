@@ -45,3 +45,6 @@ $RECYCLE.BIN/
 # Logs
 *.log
 npm-debug.log*
+
+# Matrix
+matrix-sync.json

@@ -5,12 +5,9 @@ import { spawn, type ChildProcess } from "node:child_process";
 import Database from "better-sqlite3";
 import cron from "node-cron";
 import {
-  Client, GatewayIntentBits, Events, ChannelType,
-  REST, Routes, SlashCommandBuilder,
-  ActionRowBuilder, ButtonBuilder, ButtonStyle,
-  type Message, type Collection, type Snowflake,
-  type TextChannel, type AnyThreadChannel,
-} from "discord.js";
+  MatrixTransport, MATRIX_MAX_LEN,
+  type Msg, type Room, type IncomingMessage,
+} from "./matrix.js";
 
 // --- ThreadMap (SQLite-backed) ---
 
@@ -56,9 +53,9 @@ if (fs.existsSync(JSON_PATH)) {
     });
     migrate();
     fs.renameSync(JSON_PATH, JSON_PATH + ".bak");
-    console.log(`[discord-cc-bot] migrated ${Object.keys(old).length} threads from JSON → SQLite`);
+    console.log(`[matrix-cc-bot] migrated ${Object.keys(old).length} threads from JSON → SQLite`);
   } catch (err) {
-    console.error("[discord-cc-bot] JSON migration failed:", err);
+    console.error("[matrix-cc-bot] JSON migration failed:", err);
   }
 }
 
@@ -150,60 +147,64 @@ function childEnv(): NodeJS.ProcessEnv {
   // This bot's own bookkeeping is not the agent's business. The bot token in
   // particular would otherwise be readable from the agent's shell, which is a
   // credential for the identity it is speaking as.
-  env.DISCORD_TOKEN = "";
+  env.MATRIX_ACCESS_TOKEN = "";
   return env;
 }
 
 // --- Thread History ---
 
 const SYSTEM_PROMPT = [
-  "You are a Discord bot running inside a thread.",
-  "Multiple users may be talking in the same thread.",
-  "When thread history is provided, use it as context to understand the conversation so far.",
+  "You are an agent reachable in a Matrix room.",
+  "Several people and agents may be talking in the same room.",
+  "When room history is provided, use it as context to understand the conversation so far.",
   "Reply naturally as a participant in the group conversation.",
   "IMPORTANT: Do NOT output any session handoff summaries, session recaps, bullet-point preambles, or any meta-commentary about previous sessions at the start of your reply.",
-  "Respond directly and immediately to the user's message.",
+  "Respond directly and immediately to the message.",
   "",
-  "FORMATTING: Discord does NOT render markdown tables. Never use markdown table syntax (| col | col |).",
-  "When comparing items, use bold label + slash-separated attributes on one line per item, e.g.:",
-  "**Opus** — Speed: Slow / Quality: Best / Price: $$$",
-  "**Sonnet** — Speed: Fast / Quality: Good / Price: $$",
-  "**Haiku** — Speed: Fastest / Quality: OK / Price: $",
+  "FORMATTING: your markdown is rendered to HTML, so tables, headings, lists and",
+  "code fences all display correctly. Use them where they help.",
 ].join("\n");
 
 const HISTORY_FETCH_LIMIT = 30;
 
 async function fetchThreadHistory(
-  channel: Message["channel"],
+  roomId: string,
   entry: ThreadEntry,
   botUserId: string,
   currentMessageId?: string,
 ): Promise<string> {
-  const fetchOpts: { limit: number; after?: string } = { limit: HISTORY_FETCH_LIMIT };
-  if (entry.started && entry.lastBotMessageId) {
-    fetchOpts.after = entry.lastBotMessageId;
-  }
-
-  let messages: Collection<Snowflake, Message>;
+  let events: any[];
   try {
-    messages = await channel.messages.fetch(fetchOpts);
+    const res = await transport.client.doRequest(
+      "GET", `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/messages`,
+      { dir: "b", limit: HISTORY_FETCH_LIMIT },
+    );
+    events = res?.chunk ?? [];
   } catch {
     return "";
   }
 
-  if (messages.size === 0) return "";
-
-  const sorted = [...messages.values()]
-    .sort((a, b) => a.createdTimestamp - b.createdTimestamp)
-    .filter((m) => m.author.id !== botUserId && m.id !== currentMessageId);
+  // Paginating backwards yields newest first; the model wants oldest first. Stop
+  // at our own last reply, which is where "since your last reply" is anchored.
+  const stopAt = entry.started ? entry.lastBotMessageId : undefined;
+  const collected: any[] = [];
+  for (const ev of events) {
+    if (stopAt && ev.event_id === stopAt) break;
+    if (ev.type !== "m.room.message") continue;
+    if (ev.sender === botUserId) continue;
+    if (ev.event_id === currentMessageId) continue;
+    if (ev.content?.["m.relates_to"]?.rel_type === "m.replace") continue;
+    collected.push(ev);
+  }
+  const sorted = collected.reverse();
 
   if (sorted.length === 0) return "";
 
-  const lines = sorted.map((m) => {
-    const name = m.member?.displayName ?? m.author.displayName ?? m.author.username;
-    const text = m.content.replace(/<@!?\d+>/g, "").trim();
+  const lines = (await Promise.all(sorted.map(async (m) => {
+    const name = await transport.shortName(m.sender);
+    const text = (m.content?.body ?? "").trim();
     return text ? `[${name}] ${text}` : null;
-  }).filter(Boolean);
+  }))).filter(Boolean);
 
   if (lines.length === 0) return "";
 
@@ -381,116 +382,23 @@ function runClaudeStreaming(opts: {
 
 // Generate a short, intuitive thread title from a user message using Claude Haiku.
 // Returns null on failure — caller should fall back to the placeholder name.
-function generateThreadTitle(opts: {
-  message: string;
-  claudeBin: string;
-  cwd: string;
-  timeoutMs?: number;
-}): Promise<string | null> {
-  return new Promise((resolve) => {
-    const prompt =
-      "Generate a concise Discord thread title (3-6 words, max 60 chars) summarizing this user message. " +
-      "Use Title Case. No quotes, no trailing punctuation, no emoji, no prefix like 'Title:'. " +
-      "Output ONLY the title text.\n\nMessage:\n" + opts.message;
-
-    const args = [
-      "-p", prompt,
-      "--model", "haiku",
-      "--dangerously-skip-permissions",
-      "--output-format", "text",
-    ];
-
-    const child = spawn(opts.claudeBin, args, {
-      cwd: opts.cwd,
-      env: childEnv(),
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-
-    let out = "";
-    let settled = false;
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      try { child.kill("SIGTERM"); } catch { /* ignore */ }
-      resolve(null);
-    }, opts.timeoutMs ?? 20_000);
-
-    child.stdout.on("data", (chunk: Buffer) => { out += chunk.toString(); });
-    child.on("error", () => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve(null);
-    });
-    child.on("close", (code) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      if (code !== 0) return resolve(null);
-      // Take first non-empty line, strip wrapping quotes/punctuation, truncate to 95 chars.
-      const firstLine = out.split("\n").map(l => l.trim()).find(l => l.length > 0) ?? "";
-      const cleaned = firstLine
-        .replace(/^["'`]|["'`]$/g, "")
-        .replace(/^(title|thread title)\s*[:\-]\s*/i, "")
-        .replace(/[.!?]+$/, "")
-        .trim();
-      resolve(cleaned.length > 0 ? cleaned.slice(0, 95) : null);
-    });
-  });
-}
-
-// --- AskUserQuestion button rendering ---
-
-// A button custom ID caps at 100 characters, which a 36-character session UUID
-// plus an option label overflows — and the old scheme put the label *in* the ID,
-// so a long option was silently truncated and the truncated text was sent back
-// to the model as the answer. Two options sharing a prefix became the same
-// button. Keep the answer here and put only a short handle in the ID.
-const ASK_ANSWERS_MAX = 200;
-
-/** token → the answer that button stands for. `null` means the "Other..." button. */
-const askAnswers = new Map<string, { sessionId: string; answer: string | null }>();
-
-function registerAskAnswer(sessionId: string, answer: string | null): string {
-  const token = crypto.randomBytes(8).toString("hex");
-  askAnswers.set(token, { sessionId, answer });
-  // Insertion-ordered, so the first key is the oldest.
-  while (askAnswers.size > ASK_ANSWERS_MAX) {
-    const oldest = askAnswers.keys().next().value;
-    if (oldest === undefined) break;
-    askAnswers.delete(oldest);
-  }
-  return `ask_${token}`;
-}
-
-async function sendAskButtons(
-  channel: { send: (opts: any) => Promise<Message> },
+// Matrix has no interactive components, so a confirmation is a numbered list and
+// the answer is Terry's next message in the room. What the Discord buttons were
+// actually buying is untouched: the question is asked in the agent's own room,
+// where nobody but Terry speaks, and the answer carries his MXID as its sender.
+async function sendAskPrompt(
+  room: Room,
   threadId: string,
   entry: ThreadEntry,
   denial: PermissionDenial,
 ): Promise<void> {
   for (const q of denial.tool_input.questions) {
-    const row = new ActionRowBuilder<ButtonBuilder>();
-    for (const opt of q.options.slice(0, 4)) {
-      row.addComponents(
-        new ButtonBuilder()
-          .setCustomId(registerAskAnswer(entry.sessionId, opt.label))
-          .setLabel(opt.label)
-          .setStyle(ButtonStyle.Primary),
-      );
-    }
-    if (q.options.length <= 3) {
-      row.addComponents(
-        new ButtonBuilder()
-          .setCustomId(registerAskAnswer(entry.sessionId, null))
-          .setLabel("Other...")
-          .setStyle(ButtonStyle.Secondary),
-      );
-    }
-    const botReply = await channel.send({
-      content: `❓ **${q.question}**`,
-      components: [row],
-    });
+    const opts = q.options
+      .map((o, i) => `${i + 1}. **${o.label}**${o.description ? ` — ${o.description}` : ""}`)
+      .join("\n");
+    const botReply = await room.send(
+      `❓ **${q.question}**\n\n${opts}\n\n*Reply with a number, or answer in your own words.*`,
+    );
     entry.lastBotMessageId = botReply.id;
   }
   saveEntry(threadId, entry);
@@ -500,7 +408,7 @@ async function sendAskButtons(
 
 function createToolUseHandler(ps: PreviewState): (toolName: string) => void {
   return (toolName) => {
-    console.log(`[discord-cc-bot] tool: ${toolName}`);
+    console.log(`[matrix-cc-bot] tool: ${toolName}`);
     ps.toolsUsed.push(toolName);
     if (ps.msg) {
       const text = (ps.pendingText || "").slice(0, PREVIEW_MAX_LEN);
@@ -524,8 +432,7 @@ async function downloadAttachment(url: string, filepath: string): Promise<void> 
 
 // --- Chunked message sending ---
 
-const DISCORD_MAX_LEN = 2000;
-const CHUNK_LEN = 1900;
+const CHUNK_LEN = MATRIX_MAX_LEN - 1000;
 
 function splitMessage(text: string): string[] {
   if (text.length <= CHUNK_LEN) return [text];
@@ -602,18 +509,18 @@ function splitMessage(text: string): string[] {
 }
 
 async function sendChunked(
-  channel: { send: (content: string) => Promise<Message> },
+  room: Room,
   text: string,
-  replyTo?: Message,
-): Promise<Message> {
+  replyTo?: Msg,
+): Promise<Msg> {
   const chunks = splitMessage(text);
 
-  let firstMsg: Message | undefined;
+  let firstMsg: Msg | undefined;
   for (let i = 0; i < chunks.length; i++) {
     if (i === 0 && replyTo) {
       firstMsg = await replyTo.reply(chunks[i]);
     } else {
-      const msg = await channel.send(chunks[i]);
+      const msg = await room.send(chunks[i]);
       if (i === 0) firstMsg = msg;
     }
   }
@@ -624,10 +531,10 @@ async function sendChunked(
 
 const STREAM_THROTTLE_MS = 1500;
 const STREAM_MIN_DELTA = 40;
-const PREVIEW_MAX_LEN = 1900;
+const PREVIEW_MAX_LEN = 4000;
 
 type PreviewState = {
-  msg: Message | null;
+  msg: Msg | null;
   lastText: string;
   lastEditTime: number;
   timer: NodeJS.Timeout | null;
@@ -701,7 +608,6 @@ type ChannelSchedule = {
   cron: string;
   prompt: string;
   timezone?: string;
-  useThread?: boolean;
 };
 
 type SystemPromptMode = "append" | "replace";
@@ -714,15 +620,18 @@ type ChannelConfig = {
   workingDirectory?: string;
   model?: string;
   schedule?: ChannelSchedule;
-  replyInThread?: boolean;
   contextFile?: string;
   /** Answer only when mentioned. Default false — a configured channel replies to everything. */
   requireMention?: boolean;
   /** Extra case-insensitive regexes counted as a mention, so a bare name in plain
    *  text routes as well as a real Discord ping does. */
   mentionPatterns?: string[];
-  /** Admit messages from other bots. Default false. */
+  /** Admit messages from sibling agents. Default false. */
   allowBots?: boolean;
+  /** MXIDs that count as human here. Matrix has no bot flag, so this list is the
+   *  whole of the distinction: everyone else in the room is a sibling agent, and
+   *  only a human message clears the bot-turn budget. Absent, everyone is human. */
+  humans?: string[];
   /** Consecutive bot-triggered turns allowed before this channel goes quiet
    *  until a human speaks. Default DEFAULT_BOT_TURN_BUDGET. */
   botTurnBudget?: number;
@@ -750,6 +659,8 @@ type ChannelConfigFile = {
     systemPromptMode?: SystemPromptMode;
     workingDirectory?: string;
   };
+  /** MXIDs treated as human in every room lacking its own `humans` list. */
+  defaultHumans?: string[];
   /** Ignore mentions in channels that have no entry above. Default false, which is
    *  upstream's behaviour: a mention anywhere the bot can see starts a turn with
    *  DEFAULT_CWD, the generic prompt, and none of a channel's tool denials or
@@ -765,7 +676,7 @@ function loadChannelConfig(): ChannelConfigFile {
       return JSON.parse(fs.readFileSync(CHANNEL_CONFIG_PATH, "utf8"));
     }
   } catch (err) {
-    console.error("[discord-cc-bot] failed to load channel-config.json:", err);
+    console.error("[matrix-cc-bot] failed to load channel-config.json:", err);
   }
   return { channels: {} };
 }
@@ -781,10 +692,10 @@ function loadContextFile(filePath: string): string {
   try {
     const content = fs.readFileSync(absPath, "utf8").trim();
     contextFileCache.set(filePath, content);
-    console.log(`[discord-cc-bot] loaded context file: ${filePath}`);
+    console.log(`[matrix-cc-bot] loaded context file: ${filePath}`);
     return content;
   } catch (err) {
-    console.error(`[discord-cc-bot] failed to load context file "${filePath}":`, (err as Error).message);
+    console.error(`[matrix-cc-bot] failed to load context file "${filePath}":`, (err as Error).message);
     return "";
   }
 }
@@ -805,7 +716,7 @@ function warnOnBadSessionIds(): void {
   const groups = new Map<string, Set<string>>();
   for (const [cid, cfg] of Object.entries(channelConfig.channels)) {
     if (!UUID_RE.test(cfg.sessionId)) {
-      console.error(`[discord-cc-bot] channel ${cid} ("${cfg.name}") has sessionId "${cfg.sessionId}", which is not a UUID — its first turn will fail.`);
+      console.error(`[matrix-cc-bot] channel ${cid} ("${cfg.name}") has sessionId "${cfg.sessionId}", which is not a UUID — its first turn will fail.`);
     }
     if (cfg.sessionGroup) {
       if (!groups.has(cfg.sessionGroup)) groups.set(cfg.sessionGroup, new Set());
@@ -814,7 +725,7 @@ function warnOnBadSessionIds(): void {
   }
   for (const [name, ids] of groups) {
     if (ids.size > 1) {
-      console.error(`[discord-cc-bot] sessionGroup "${name}" spans ${ids.size} different sessionIds — whichever channel speaks first seeds the group and the rest are ignored.`);
+      console.error(`[matrix-cc-bot] sessionGroup "${name}" spans ${ids.size} different sessionIds — whichever channel speaks first seeds the group and the rest are ignored.`);
     }
   }
 }
@@ -833,7 +744,7 @@ warnOnBadSessionIds();
 
 // Watch for config changes and reload
 fs.watchFile(CHANNEL_CONFIG_PATH, { interval: 5000 }, () => {
-  console.log("[discord-cc-bot] reloading channel-config.json");
+  console.log("[matrix-cc-bot] reloading channel-config.json");
   channelConfig = loadChannelConfig();
   preloadContextFiles();
   warnOnBadSessionIds();
@@ -848,9 +759,8 @@ function getChannelAgent(channelId: string): ChannelConfig | null {
 // private channel and the same session sees the answer, which is what keeps the
 // private channel meaningful instead of merely quieter. Threads always get their
 // own session — grouping is about rooms, not about spawned side-conversations.
-function sessionKey(channelId: string, agent: ChannelConfig | null, isThread: boolean): string {
-  if (isThread) return channelId;
-  return agent?.sessionGroup ? `group:${agent.sessionGroup}` : channelId;
+function sessionKey(roomId: string, agent: ChannelConfig | null): string {
+  return agent?.sessionGroup ? `group:${agent.sessionGroup}` : roomId;
 }
 
 function resolveSystemPromptMode(agent: ChannelConfig | null): SystemPromptMode {
@@ -867,7 +777,7 @@ function matchesMentionPatterns(content: string, agent: ChannelConfig | null): b
     try {
       return new RegExp(pattern, "i").test(content);
     } catch (err) {
-      console.error(`[discord-cc-bot] bad mentionPattern ${JSON.stringify(pattern)}:`, (err as Error).message);
+      console.error(`[matrix-cc-bot] bad mentionPattern ${JSON.stringify(pattern)}:`, (err as Error).message);
       return false;
     }
   });
@@ -893,7 +803,7 @@ function consumeBotTurnBudget(channelId: string, fromBot: boolean, agent: Channe
   const used = (botTurnsUsed.get(channelId) ?? 0) + 1;
   botTurnsUsed.set(channelId, used);
   if (used > budget) {
-    console.log(`[discord-cc-bot] bot-turn budget (${budget}) spent in ${channelId} — quiet until a human speaks`);
+    console.log(`[matrix-cc-bot] bot-turn budget (${budget}) spent in ${channelId} — quiet until a human speaks`);
     return false;
   }
   return true;
@@ -988,689 +898,427 @@ function overDailyBudget(channelId: string, agent: ChannelConfig | null): { over
 // from doing.
 const SILENT_TOKEN = process.env.SILENT_TOKEN ?? "NO_RESPONSE";
 
-// --- Discord ---
+// --- Matrix ---
 
-const DISCORD_TOKEN = process.env.DISCORD_TOKEN!;
+const HOMESERVER_URL = process.env.MATRIX_HOMESERVER_URL ?? "http://localhost:8008";
+const ACCESS_TOKEN = process.env.MATRIX_ACCESS_TOKEN!;
 const DEFAULT_CWD = process.env.DEFAULT_CWD ?? process.cwd();
 const CLAUDE_BIN = process.env.CLAUDE_BIN ?? "claude";
-const GUILD_ID = process.env.GUILD_ID;
+const STORAGE_PATH = process.env.MATRIX_STORAGE
+  ?? path.join(import.meta.dirname, "..", "matrix-sync.json");
 
-const slashCommands = [
-  new SlashCommandBuilder().setName("help").setDescription("Show available commands"),
-  new SlashCommandBuilder().setName("new").setDescription("Clear context — start a new conversation"),
-  new SlashCommandBuilder().setName("model").setDescription("Switch Claude model")
-    .addStringOption(o => o.setName("name").setDescription("Model name (e.g. sonnet, opus, haiku)").setRequired(true)),
-  new SlashCommandBuilder().setName("cd").setDescription("Switch working directory")
-    .addStringOption(o => o.setName("path").setDescription("Absolute path to directory").setRequired(true)),
-  new SlashCommandBuilder().setName("stop").setDescription("Kill running Claude process"),
-  new SlashCommandBuilder().setName("sessions").setDescription("List all active sessions"),
-  new SlashCommandBuilder().setName("channels").setDescription("List configured channel agents"),
-  new SlashCommandBuilder().setName("reload-config").setDescription("Reload channel-config.json"),
-];
-
-if (!DISCORD_TOKEN) {
-  console.error("Missing DISCORD_TOKEN");
+if (!ACCESS_TOKEN) {
+  console.error("Missing MATRIX_ACCESS_TOKEN");
   process.exit(1);
 }
 
 const threadMap = loadMap();
+const transport = new MatrixTransport(HOMESERVER_URL, ACCESS_TOKEN, STORAGE_PATH);
 
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
-  ],
-});
+// Slash commands are Discord application commands; Matrix has no equivalent
+// registry, so they are plain text prefixes. Same names, same behaviour.
+const TEXT_COMMANDS = [
+  ["!help", "Show available commands"],
+  ["!new", "Clear context — start a new conversation"],
+  ["!model <name>", "Switch Claude model"],
+  ["!cd <path>", "Switch working directory"],
+  ["!stop", "Kill running Claude process"],
+  ["!sessions", "List all active sessions"],
+  ["!rooms", "List configured room agents"],
+  ["!reload-config", "Reload channel-config.json"],
+] as const;
 
-client.once(Events.ClientReady, async (c) => {
-  console.log(`[discord-cc-bot] ready as ${c.user.tag}`);
-  console.log(
-    `[discord-cc-bot] auth: ${hasStoredCredentials()
-      ? `stored credentials (${CREDENTIALS_PATH}); CLAUDE_CODE_OAUTH_TOKEN blanked for children`
-      : process.env.CLAUDE_CODE_OAUTH_TOKEN
-        ? "CLAUDE_CODE_OAUTH_TOKEN from the environment"
-        : "none found — the CLI will resolve its own"}`,
-  );
-  const rest = new REST().setToken(DISCORD_TOKEN);
-  try {
-    const route = GUILD_ID
-      ? Routes.applicationGuildCommands(c.user.id, GUILD_ID)
-      : Routes.applicationCommands(c.user.id);
-    await rest.put(route, {
-      body: slashCommands.map(cmd => cmd.toJSON()),
-    });
-    console.log(`[discord-cc-bot] registered ${slashCommands.length} slash commands`);
-  const configured = Object.entries(channelConfig.channels);
-  console.log(
-    configured.length
-      ? `[discord-cc-bot] ${configured.length} channel(s): ` + configured
-          .map(([cid, c]) => `${c.name}=${cid}${c.sessionGroup ? ` group:${c.sessionGroup}` : ""}${c.requireMention ? " mention" : ""}${c.allowBots ? " bots" : ""}${c.fetchHistory === false ? " nohistory" : ""}${c.disallowedTools?.length ? ` -${c.disallowedTools.length}tools` : ""}`)
-          .join(", ")
-      : "[discord-cc-bot] no channel-config.json — mention-only with defaults",
-  );
-  console.log(`[discord-cc-bot] unconfigured channels: ${channelConfig.configuredChannelsOnly ? "ignored" : "answer on mention with defaults"}`);
-  } catch (err) {
-    console.error("[discord-cc-bot] failed to register commands:", err);
-  }
+// --- Text commands ---
 
-  // --- Scheduled Jobs ---
-  startScheduledJobs(c);
-});
+async function handleCommand(msg: IncomingMessage, room: Room): Promise<boolean> {
+  const [cmd, ...rest] = msg.content.trim().split(/\s+/);
+  const arg = rest.join(" ").trim();
+  const agent = getChannelAgent(msg.roomId);
+  const threadId = sessionKey(msg.roomId, agent);
 
-const scheduledTasks: cron.ScheduledTask[] = [];
+  switch (cmd) {
+    case "!help":
+      await room.send(TEXT_COMMANDS.map(([c, d]) => `\`${c}\` — ${d}`).join("\n"));
+      return true;
 
-function startScheduledJobs(c: Client<true>): void {
-  // Clear any existing tasks (in case of config reload)
-  for (const task of scheduledTasks) task.stop();
-  scheduledTasks.length = 0;
-
-  for (const [channelId, cfg] of Object.entries(channelConfig.channels)) {
-    if (!cfg.schedule) continue;
-
-    const { cron: cronExpr, prompt, timezone } = cfg.schedule;
-    console.log(`[discord-cc-bot] scheduling "${cfg.name}" → "${cronExpr}"${timezone ? ` (${timezone})` : ""}`);
-
-    const task = cron.schedule(cronExpr, async () => {
-      console.log(`[discord-cc-bot] cron fired for #${cfg.name}`);
-      let release: (() => void) | null = null;
-      try {
-        const channel = await c.channels.fetch(channelId);
-        if (!channel || !("send" in channel)) {
-          console.error(`[discord-cc-bot] cron: cannot send to channel ${channelId}`);
-          return;
-        }
-
-        const agentCwd = cfg.workingDirectory ?? channelConfig.defaults?.workingDirectory ?? DEFAULT_CWD;
-        const agentModel = cfg.model ?? channelConfig.defaults?.model ?? "opus";
-        const baseSchedulePrompt = cfg.systemPrompt ?? channelConfig.defaults?.systemPrompt ?? "";
-        const scheduleContext = getContextForChannel(cfg);
-        const agentSystemPrompt = scheduleContext
-          ? `Channel context:\n${scheduleContext}\n\n${baseSchedulePrompt}`
-          : baseSchedulePrompt;
-
-        // When useThread is enabled, create a dated thread and post inside it
-        const useThread = cfg.schedule?.useThread ?? false;
-        let target: { send: (typeof channel)["send"] } = channel;
-        let threadId: string | undefined;
-
-        if (useThread && "threads" in channel) {
-          const dateStr = new Date().toLocaleDateString("en-US", {
-            weekday: "long",
-            year: "numeric",
-            month: "long",
-            day: "numeric",
-            timeZone: cfg.schedule?.timezone ?? "America/Chicago",
-          });
-          const newThread = await (channel as TextChannel).threads.create({
-            name: `📧 ${dateStr}`,
-            autoArchiveDuration: 1440, // 24 hours
-            type: ChannelType.PublicThread,
-          });
-          target = newThread;
-          threadId = newThread.id;
-          console.log(`[discord-cc-bot] cron: created thread "${dateStr}" for #${cfg.name}`);
-        }
-
-        const targetId = threadId ?? channelId;
-        const entry = getOrCreate(threadMap, targetId, agentCwd, threadId ? undefined : cfg.sessionId);
-        entry.cwd = agentCwd;
-        entry.model = agentModel;
-
-        release = await acquireTurn(entry.sessionId);
-        if (!release) {
-          console.log(`[discord-cc-bot] cron: #${cfg.name} session busy, skipping this firing`);
-          return;
-        }
-
-        const statusMsg = await target.send("⏳ *Running scheduled task...*");
-
-        const previewState = createPreviewState();
-        previewState.msg = statusMsg;
-
-        const result = await runClaudeStreaming({
-          sessionId: entry.sessionId,
-          prompt,
-          cwd: entry.cwd,
-          model: entry.model,
-          claudeBin: CLAUDE_BIN,
-          resume: entry.started,
-          systemPrompt: agentSystemPrompt,
-          systemPromptMode: resolveSystemPromptMode(cfg),
-          maxBudgetUsd: cfg.maxCostUsdPerTurn,
-          disallowedTools: cfg.disallowedTools,
-          callbacks: {
-            onText: (fullText) => handleStreamText(previewState, fullText),
-            onToolUse: createToolUseHandler(previewState),
-          },
-        });
-
-        recordSpend(channelId, result.costUsd);
-
-        if (previewState.timer) clearTimeout(previewState.timer);
-
-        entry.started = true;
-        await statusMsg.delete().catch(() => {});
-
-        let botReply: Message;
-        if (result.text.length <= DISCORD_MAX_LEN) {
-          botReply = await target.send(result.text);
-        } else {
-          botReply = await sendChunked(target, result.text);
-        }
-
-        entry.lastBotMessageId = botReply.id;
-        saveEntry(targetId, entry);
-
-        console.log(`[discord-cc-bot] cron: #${cfg.name} completed`);
-      } catch (err) {
-        console.error(`[discord-cc-bot] cron error for #${cfg.name}:`, (err as Error).message);
-      } finally {
-        release?.();
-      }
-    }, { timezone: timezone ?? undefined });
-
-    scheduledTasks.push(task);
-  }
-
-  if (scheduledTasks.length > 0) {
-    console.log(`[discord-cc-bot] started ${scheduledTasks.length} scheduled job(s)`);
-  }
-}
-
-client.on(Events.InteractionCreate, async (interaction) => {
-  // --- Button handler ---
-  if (interaction.isButton()) {
-    const id = interaction.customId;
-    console.log(`[discord-cc-bot] button: ${id} by ${interaction.user.username}`);
-
-    // AskUserQuestion buttons: ask_<sessionId>_<answer>
-    if (id.startsWith("ask_")) {
-      const pending = askAnswers.get(id.slice(4));
-      const threadId = sessionKey(
-        interaction.channelId,
-        getChannelAgent(interaction.channelId),
-        interaction.channel?.isThread() ?? false,
-      );
+    case "!new": {
       const entry = threadMap[threadId];
-
-      // The registry is in memory and does not survive a restart. Say so rather
-      // than sending the model an answer nobody chose.
-      if (!pending) {
-        await interaction.update({ content: "⌛ *This prompt expired — ask again.*", components: [] });
-        return;
-      }
-
-      const answer = pending.answer;
-      if (answer === null) {
-        await interaction.reply({ content: "Type your answer as a regular message:", ephemeral: true });
-        return;
-      }
-
-      await interaction.update({ content: `✅ **${answer}**`, components: [] });
-
-      // Resume claude with the answer
-      if (entry && !running.has(entry.sessionId)) {
-        const ch = interaction.channel!;
-        if (!("send" in ch)) return;
-        const previewState = createPreviewState();
-        previewState.msg = await ch.send("⏳ *Continuing...*");
-
-        try {
-          const result = await runClaudeStreaming({
-            sessionId: entry.sessionId,
-            prompt: `I choose: ${answer}`,
-            cwd: entry.cwd,
-            model: entry.model,
-            claudeBin: CLAUDE_BIN,
-            resume: true,
-            systemPrompt: SYSTEM_PROMPT,
-            callbacks: {
-              onText: (fullText) => handleStreamText(previewState, fullText),
-              onToolUse: createToolUseHandler(previewState),
-            },
-          });
-
-          if (previewState.timer) clearTimeout(previewState.timer);
-
-          // Check for AskUserQuestion denials — render as Discord buttons
-          const askDenial = result.permissionDenials?.find(d => d.tool_name === "AskUserQuestion");
-          if (askDenial) {
-            await previewState.msg!.delete().catch(() => {});
-            await sendAskButtons(ch, threadId, entry, askDenial);
-            return;
-          }
-
-          await previewState.msg!.delete().catch(() => {});
-          let botReply: Message;
-          if (result.text.length <= DISCORD_MAX_LEN) {
-            botReply = await ch.send(result.text);
-          } else {
-            botReply = await sendChunked(ch, result.text);
-          }
-          entry.lastBotMessageId = botReply.id;
-            saveEntry(threadId, entry);
-        } catch (err) {
-          if (previewState.timer) clearTimeout(previewState.timer);
-          if (previewState.msg) await previewState.msg.edit(`Error: ${(err as Error).message}`).catch(() => {});
-        }
-      }
-      return;
-    }
-
-    return;
-  }
-
-  if (!interaction.isChatInputCommand()) return;
-
-  const { commandName } = interaction;
-
-  try {
-    if (commandName === "help") {
-      await interaction.reply({
-        content: [
-          "`/new` — clear context, start new conversation",
-          "`/model <name>` — switch model (e.g. sonnet, opus, haiku)",
-          "`/cd <path>` — switch working directory",
-          "`/stop` — kill running task",
-          "`/sessions` — list all sessions",
-          "`/channels` — list configured channel agents",
-          "`/reload-config` — reload channel-config.json",
-        ].join("\n"),
-        ephemeral: true,
-      });
-      return;
-    }
-
-    if (commandName === "new") {
-      const channelId = interaction.channelId;
-      const agent = getChannelAgent(channelId);
-      if (!interaction.channel?.isThread() && !agent) {
-        await interaction.reply({ content: "This command only works in threads or configured channels.", ephemeral: true });
-        return;
-      }
-      const threadId = sessionKey(channelId, agent, interaction.channel?.isThread() ?? false);
-      const agentCwd = agent?.workingDirectory ?? channelConfig.defaults?.workingDirectory ?? DEFAULT_CWD;
-      const entry = getOrCreate(threadMap, threadId, agentCwd);
-      // For configured channels, reset to a new session but keep the agent prefix
-      // Always a fresh UUID: --session-id must be one, and appending a timestamp
-      // to the configured id produced a string the CLI rejects. The config's
-      // sessionId seeds a channel's first session only.
-      entry.sessionId = crypto.randomUUID();
-      entry.started = false;
-      saveEntry(threadId, entry);
-      const label = agent ? `**${agent.name}** agent` : "conversation";
-      await interaction.reply({ content: `Context cleared. Next message starts a new ${label}.`, ephemeral: true });
-      return;
-    }
-
-    if (commandName === "model") {
-      const name = interaction.options.getString("name", true);
-      if (!interaction.channel?.isThread()) {
-        await interaction.reply({ content: "This command only works in threads.", ephemeral: true });
-        return;
-      }
-      const threadId = sessionKey(interaction.channelId, getChannelAgent(interaction.channelId), interaction.channel?.isThread() ?? false);
-      const entry = getOrCreate(threadMap, threadId, DEFAULT_CWD);
-      entry.model = name;
-      saveEntry(threadId, entry);
-      await interaction.reply({ content: `Model -> \`${name}\``, ephemeral: true });
-      return;
-    }
-
-    if (commandName === "cd") {
-      const dir = interaction.options.getString("path", true);
-      if (!fs.existsSync(dir)) {
-        await interaction.reply({ content: `Path not found: \`${dir}\``, ephemeral: true });
-        return;
-      }
-      if (!interaction.channel?.isThread()) {
-        await interaction.reply({ content: "This command only works in threads.", ephemeral: true });
-        return;
-      }
-      const threadId = interaction.channelId;
-      const entry = getOrCreate(threadMap, threadId, DEFAULT_CWD);
-      entry.cwd = dir;
-      saveEntry(threadId, entry);
-      await interaction.reply({ content: `cwd -> \`${dir}\``, ephemeral: true });
-      return;
-    }
-
-    if (commandName === "stop") {
-      const channelId = interaction.channelId;
-      const agent = getChannelAgent(channelId);
-      if (!interaction.channel?.isThread() && !agent) {
-        await interaction.reply({ content: "This command only works in threads or configured channels.", ephemeral: true });
-        return;
-      }
-      const threadId = sessionKey(channelId, agent, interaction.channel?.isThread() ?? false);
-      const entry = threadMap[threadId];
-      if (entry && running.has(entry.sessionId)) {
-        running.get(entry.sessionId)!.kill("SIGTERM");
-        await interaction.reply({ content: "Stopped.", ephemeral: true });
-      } else {
-        await interaction.reply({ content: "Nothing running.", ephemeral: true });
-      }
-      return;
-    }
-
-    if (commandName === "channels") {
-      const entries = Object.entries(channelConfig.channels);
-      if (entries.length === 0) {
-        await interaction.reply({ content: "No channels configured. Edit `channel-config.json`.", ephemeral: true });
-        return;
-      }
-      const lines = entries.map(([id, cfg]) =>
-        `<#${id}> — **${cfg.name}** | \`${cfg.workingDirectory ?? DEFAULT_CWD}\` | ${cfg.model ?? "opus"}`
-      );
-      await interaction.reply({ content: lines.join("\n"), ephemeral: true });
-      return;
-    }
-
-    if (commandName === "reload-config") {
-      channelConfig = loadChannelConfig();
-      preloadContextFiles();
-      const count = Object.keys(channelConfig.channels).length;
-      await interaction.reply({ content: `Reloaded config: ${count} channel(s) configured.`, ephemeral: true });
-      return;
-    }
-
-    if (commandName === "sessions") {
-      const lines = Object.entries(threadMap).map(
-        ([tid, e]) => `${tid.startsWith("group:") ? `**${tid.slice(6)}** (group)` : `<#${tid}>`} | ${e.model} | \`${e.cwd}\``,
-      );
-      await interaction.reply({
-        content: lines.length ? lines.join("\n") : "No sessions.",
-        ephemeral: true,
-      });
-      return;
-    }
-
-  } catch (err) {
-    console.error("[discord-cc-bot] interaction error:", (err as Error).message);
-    if (!interaction.replied) {
-      await interaction.reply({ content: "An error occurred.", ephemeral: true }).catch(() => {});
-    }
-  }
-});
-
-client.on(Events.MessageCreate, async (message) => {
-  let releaseTurn: (() => void) | null = null;
-  try {
-    // Never react to our own output, whatever the bot policy is.
-    if (message.author.id === client.user!.id) return;
-
-    // Check if this is a configured channel (agent routing)
-    // Also check parent channel for threads inside configured channels
-    const agent = getChannelAgent(message.channelId)
-      ?? (message.channel.isThread() ? getChannelAgent(message.channel.parentId!) : null);
-
-    const fromBot = message.author.bot;
-    if (fromBot && !(agent?.allowBots ?? false)) return;
-
-    const isMentioned = message.mentions.has(client.user!.id)
-      || matchesMentionPatterns(message.content, agent);
-
-    if (agent) {
-      // Configured channel (or thread inside one) — everything, unless gated
-      if ((agent.requireMention ?? false) && !isMentioned) return;
-    } else if (isMentioned) {
-      // @mentioned in a channel with no config. Whether that is a feature or a
-      // hole in a boundary depends on the deployment, so it is a setting.
-      if (channelConfig.configuredChannelsOnly) {
-        console.log(`[discord-cc-bot] mention in unconfigured channel ${message.channelId} — ignored (configuredChannelsOnly)`);
-        return;
-      }
-    } else {
-      return;
-    }
-
-    if (!consumeBotTurnBudget(message.channelId, fromBot, agent)) return;
-
-    const budget = overDailyBudget(message.channelId, agent);
-    if (budget.over) {
-      console.log(`[discord-cc-bot] daily budget spent in ${message.channelId}: $${budget.spent.toFixed(2)} of $${budget.cap.toFixed(2)}`);
-      if (budget.announce) {
-        await message.reply(`💸 *Daily budget reached ($${budget.spent.toFixed(2)} of $${budget.cap.toFixed(2)}). Quiet until UTC midnight.*`).catch(() => {});
-      }
-      return;
-    }
-
-    const content = message.content.replace(/<@!?\d+>/g, "").trim();
-    const attachments = [...message.attachments.values()];
-    if (!content && attachments.length === 0) return;
-
-    // Thread-first: create a thread from the user's message in configured channels
-    const shouldThread = agent?.replyInThread === true && !message.channel.isThread();
-    let thread: AnyThreadChannel | null = null;
-    if (shouldThread) {
-      const threadName = content.length > 97
-        ? content.slice(0, 97) + "..."
-        : content || "Thread";
-      thread = await message.startThread({
-        name: threadName,
-        autoArchiveDuration: 1440,
-      });
-      // Fire-and-forget: generate a prettier title with Haiku and rename the thread.
-      // Runs in parallel with the main Claude response so it doesn't add latency.
-      const createdThread = thread;
-      (async () => {
-        try {
-          const title = await generateThreadTitle({
-            message: content,
-            claudeBin: CLAUDE_BIN,
-            cwd: agent?.workingDirectory ?? channelConfig.defaults?.workingDirectory ?? DEFAULT_CWD,
-          });
-          if (title && title !== createdThread.name) {
-            await createdThread.setName(title);
-          }
-        } catch (err) {
-          console.error("[discord-cc-bot] thread rename failed:", err);
-        }
-      })();
-    }
-
-    const threadId = thread
-      ? thread.id
-      : sessionKey(message.channelId, agent, message.channel.isThread());
-
-    // For configured channels, use the channel's config for cwd/model/sessionId
-    const agentCwd = agent?.workingDirectory ?? channelConfig.defaults?.workingDirectory ?? DEFAULT_CWD;
-    const agentModel = agent?.model ?? channelConfig.defaults?.model ?? "opus";
-    const baseSystemPrompt = agent?.systemPrompt ?? channelConfig.defaults?.systemPrompt ?? SYSTEM_PROMPT;
-    const channelContext = agent ? getContextForChannel(agent) : "";
-    const agentSystemPrompt = channelContext
-      ? `Channel context:\n${channelContext}\n\n${baseSystemPrompt}`
-      : baseSystemPrompt;
-
-    let entry: ThreadEntry;
-    if (agent) {
-      // A thread spawned from a configured channel is its own conversation and
-      // gets a fresh id; the channel itself starts from the configured one.
-      entry = getOrCreate(threadMap, threadId, agentCwd, thread ? undefined : agent.sessionId);
-      entry.cwd = agentCwd;
-      entry.model = agentModel;
-    } else {
-      entry = getOrCreate(threadMap, threadId, DEFAULT_CWD);
-    }
-
-    releaseTurn = await acquireTurn(entry.sessionId);
-    if (!releaseTurn) {
-      console.log(`[discord-cc-bot] queue full for ${entry.sessionId} — dropping message ${message.id}`);
-      return;
-    }
-
-    // Send initial preview message (in thread if thread-first)
-    const previewState = createPreviewState();
-    previewState.msg = thread
-      ? await thread.send("⏳ *Thinking...*")
-      : await message.reply("⏳ *Thinking...*");
-
-    // Download all attachments — let Claude Code handle them via Read tool
-    const filePaths: string[] = [];
-    for (const att of attachments) {
-      if (att.size > ATTACH_MAX_BYTES) {
-        console.log(`[discord-cc-bot] skipping oversized attachment: ${att.name} (${att.size} bytes)`);
-        continue;
-      }
-      const ext = att.name?.split(".").pop() ?? "bin";
-      const filepath = path.join(ATTACH_TMP_DIR, `${message.id}_${att.id}.${ext}`);
-      try {
-        await downloadAttachment(att.url, filepath);
-        filePaths.push(filepath);
-      } catch (err) {
-        console.error(`[discord-cc-bot] attachment download failed: ${(err as Error).message}`);
-      }
-    }
-
-    try {
-      const historyChannel = thread ?? message.channel;
-      // fetchThreadHistory filters only this bot's own messages, so in a channel
-      // shared with sibling bots it pulls their traffic in whether or not this
-      // agent was addressed. Off is the right default for such a channel.
-      const history = (agent?.fetchHistory ?? true)
-        ? await fetchThreadHistory(historyChannel, entry, client.user!.id, message.id)
-        : "";
-      // Once several speakers share a channel the model has no other way to tell
-      // who is talking, and who is talking is the whole of the routing.
-      const speaker = message.member?.displayName ?? message.author.displayName ?? message.author.username;
-      const body = (agent?.allowBots ?? false) ? `[${speaker}] ${content}` : content;
-      let userMessage = body;
-      if (filePaths.length === 1) {
-        userMessage = `${body}\n\nThe user attached a file: ${filePaths[0]}`.trim();
-      } else if (filePaths.length > 1) {
-        userMessage = `${body}\n\nThe user attached files:\n${filePaths.map((p) => `- ${p}`).join("\n")}`.trim();
-      }
-      const prompt = history ? `${history}${userMessage}` : userMessage;
-
-      const systemPrompt = agent
-        ? agentSystemPrompt
-        : SYSTEM_PROMPT;
-
-      let result = await runClaudeStreaming({
-        sessionId: entry.sessionId,
-        prompt,
-        cwd: entry.cwd,
-        model: entry.model,
-        claudeBin: CLAUDE_BIN,
-        resume: entry.started,
-        systemPrompt,
-        systemPromptMode: resolveSystemPromptMode(agent),
-        maxBudgetUsd: agent?.maxCostUsdPerTurn,
-        disallowedTools: agent?.disallowedTools,
-        callbacks: {
-          onText: (fullText) => handleStreamText(previewState, fullText),
-          onToolUse: createToolUseHandler(previewState),
-        },
-      });
-
-      // If --resume failed because the session no longer exists, reset and retry fresh
-      if (entry.started && result.is_error && /no conversation found/i.test(result.text)) {
-        console.log(`[discord-cc-bot] session ${entry.sessionId} not found, starting fresh`);
+      if (entry) {
+        const child = running.get(entry.sessionId);
+        if (child) child.kill("SIGTERM");
         entry.sessionId = crypto.randomUUID();
         entry.started = false;
         saveEntry(threadId, entry);
-        result = await runClaudeStreaming({
-          sessionId: entry.sessionId,
-          prompt,
-          cwd: entry.cwd,
-          model: entry.model,
-          claudeBin: CLAUDE_BIN,
-          resume: false,
-          systemPrompt,
-          systemPromptMode: resolveSystemPromptMode(agent),
-          maxBudgetUsd: agent?.maxCostUsdPerTurn,
-          disallowedTools: agent?.disallowedTools,
-          callbacks: {
-            onText: (fullText) => handleStreamText(previewState, fullText),
-            onToolUse: createToolUseHandler(previewState),
-          },
-        });
       }
+      await room.send("🆕 *Context cleared.*");
+      return true;
+    }
 
-      recordSpend(message.channelId, result.costUsd);
+    case "!model": {
+      if (!arg) { await room.send("Usage: `!model sonnet|opus|haiku`"); return true; }
+      const entry = getOrCreate(threadMap, threadId, agent?.workingDirectory ?? DEFAULT_CWD);
+      entry.model = arg;
+      saveEntry(threadId, entry);
+      await room.send(`🤖 *Model set to \`${arg}\`.*`);
+      return true;
+    }
 
-      // Cancel any pending throttle timer
-      if (previewState.timer) clearTimeout(previewState.timer);
+    case "!cd": {
+      if (!arg.startsWith("/")) { await room.send("Usage: `!cd /absolute/path`"); return true; }
+      if (!fs.existsSync(arg)) { await room.send(`No such directory: \`${arg}\``); return true; }
+      const entry = getOrCreate(threadMap, threadId, arg);
+      entry.cwd = arg;
+      saveEntry(threadId, entry);
+      await room.send(`📁 *Working directory set to \`${arg}\`.*`);
+      return true;
+    }
 
-      // Check for AskUserQuestion denials — render as Discord buttons
-      const askDenial = result.permissionDenials?.find(d => d.tool_name === "AskUserQuestion");
-      if (askDenial) {
-        await previewState.msg!.delete().catch(() => {});
-        entry.started = true;
-        await sendAskButtons(thread ?? message.channel, threadId, entry, askDenial);
-        return; // Wait for button click — handler will resume
-      }
+    case "!stop": {
+      const entry = threadMap[threadId];
+      const child = entry && running.get(entry.sessionId);
+      if (child) { child.kill("SIGTERM"); await room.send("🛑 *Stopped.*"); }
+      else await room.send("*Nothing running.*");
+      return true;
+    }
 
-      // The model declined to speak. Post nothing — in a channel where bots hear
-      // each other, silence is what ends the exchange.
-      if (result.text.trim().startsWith(SILENT_TOKEN)) {
-        await previewState.msg!.delete().catch(() => {});
-        entry.started = true;
-        saveEntry(threadId, entry);
-        console.log(`[discord-cc-bot] ${SILENT_TOKEN} in ${threadId} — nothing posted`);
+    case "!sessions": {
+      const lines = Object.entries(threadMap).map(([k, e]) =>
+        `\`${k}\` — ${e.sessionId.slice(0, 8)} ${e.model ?? "?"} ${running.has(e.sessionId) ? "▶︎" : ""}`);
+      await room.send(lines.length ? lines.join("\n") : "*No sessions.*");
+      return true;
+    }
+
+    case "!rooms": {
+      const lines = Object.entries(channelConfig.channels).map(([rid, c]) =>
+        `**${c.name}** \`${rid}\`${c.sessionGroup ? ` group:${c.sessionGroup}` : ""}${c.requireMention ? " mention" : ""}`);
+      await room.send(lines.length ? lines.join("\n") : "*No configured rooms.*");
+      return true;
+    }
+
+    case "!reload-config":
+      channelConfig = loadChannelConfig();
+      preloadContextFiles();
+      warnOnBadSessionIds();
+      applyRoomHumans();
+      startScheduledJobs();
+      await room.send(`♻️ *Reloaded — ${Object.keys(channelConfig.channels).length} room(s).*`);
+      return true;
+  }
+  return false;
+}
+
+// --- Scheduled jobs ---
+
+const scheduledTasks: cron.ScheduledTask[] = [];
+
+function startScheduledJobs(): void {
+  for (const task of scheduledTasks) task.stop();
+  scheduledTasks.length = 0;
+
+  for (const [roomId, cfg] of Object.entries(channelConfig.channels)) {
+    if (!cfg.schedule) continue;
+    const { cron: cronExpr, prompt, timezone } = cfg.schedule;
+    if (!cron.validate(cronExpr)) {
+      console.error(`[matrix-cc-bot] invalid cron for "${cfg.name}": ${cronExpr}`);
+      continue;
+    }
+    console.log(`[matrix-cc-bot] scheduling "${cfg.name}" → "${cronExpr}"${timezone ? ` (${timezone})` : ""}`);
+
+    const task = cron.schedule(cronExpr, async () => {
+      console.log(`[matrix-cc-bot] cron fired for ${cfg.name}`);
+      const room = transport.room(roomId);
+      const threadId = sessionKey(roomId, cfg);
+      const entry = getOrCreate(threadMap, threadId,
+        cfg.workingDirectory ?? channelConfig.defaults?.workingDirectory ?? DEFAULT_CWD, cfg.sessionId);
+
+      // Cron takes the same lane as a message: `running` only fills once a child
+      // has spawned, so checking it alone races a turn that is still starting.
+      const release = await acquireTurn(entry.sessionId);
+      if (!release) {
+        console.log(`[matrix-cc-bot] cron: ${cfg.name} session busy, skipping this firing`);
         return;
       }
-
-      const isFirstReply = !entry.started;
-      if (isFirstReply) {
-        entry.started = true;
-      }
-
-      const responseText = result.text;
-
-      // Final delivery — always delete preview and send new message
-      // so Discord sends a push notification for the completed reply.
-      let botReply: Message;
       try {
-        await previewState.msg!.delete().catch(() => {});
-        if (thread) {
-          // Thread-first: send inside the thread
-          if (responseText.length <= DISCORD_MAX_LEN) {
-            botReply = await thread.send(responseText);
-          } else {
-            botReply = await sendChunked(thread, responseText);
-          }
-        } else {
-          // Normal: reply to the message directly
-          if (responseText.length <= DISCORD_MAX_LEN) {
-            botReply = await message.reply(responseText);
-          } else {
-            botReply = await sendChunked(message.channel, responseText, message);
-          }
+        const budget = overDailyBudget(roomId, cfg);
+        if (budget.over) {
+          console.log(`[matrix-cc-bot] cron: ${cfg.name} over daily budget, skipping`);
+          return;
         }
-      } catch (replyErr) {
-        console.error("[discord-cc-bot] reply failed, trying fallback:", (replyErr as Error).message);
-        botReply = await (thread ?? message.channel).send(responseText.slice(0, DISCORD_MAX_LEN));
+        await runTurn({
+          room, roomId, threadId, entry, agent: cfg,
+          prompt, replyTo: undefined,
+        });
+      } catch (err) {
+        console.error(`[matrix-cc-bot] cron error for ${cfg.name}:`, (err as Error).message);
+      } finally {
+        release();
       }
+    }, timezone ? { timezone } : undefined);
 
-      entry.lastBotMessageId = botReply.id;
+    scheduledTasks.push(task);
+  }
+  if (scheduledTasks.length) console.log(`[matrix-cc-bot] started ${scheduledTasks.length} scheduled job(s)`);
+}
+
+// --- One turn ---
+
+/** Runs Claude for one turn and delivers the result. Shared by messages and cron. */
+async function runTurn(opts: {
+  room: Room;
+  roomId: string;
+  threadId: string;
+  entry: ThreadEntry;
+  agent: ChannelConfig | null;
+  prompt: string;
+  replyTo?: Msg;
+  filePaths?: string[];
+}): Promise<void> {
+  const { room, roomId, threadId, entry, agent, prompt, replyTo } = opts;
+
+  const previewState = createPreviewState();
+  previewState.msg = replyTo
+    ? await replyTo.reply("⏳ *Thinking...*")
+    : await room.send("⏳ *Thinking...*");
+  await transport.setTyping(roomId, true);
+
+  const baseSystemPrompt = agent?.systemPrompt ?? channelConfig.defaults?.systemPrompt ?? SYSTEM_PROMPT;
+  const channelContext = agent ? getContextForChannel(agent) : "";
+  const systemPrompt = channelContext
+    ? `Channel context:\n${channelContext}\n\n${baseSystemPrompt}`
+    : baseSystemPrompt;
+
+  const runOpts = {
+    sessionId: entry.sessionId,
+    prompt,
+    cwd: entry.cwd,
+    model: entry.model,
+    claudeBin: CLAUDE_BIN,
+    systemPrompt,
+    systemPromptMode: resolveSystemPromptMode(agent),
+    maxBudgetUsd: agent?.maxCostUsdPerTurn,
+    disallowedTools: agent?.disallowedTools,
+    callbacks: {
+      onText: (fullText: string) => handleStreamText(previewState, fullText),
+      onToolUse: createToolUseHandler(previewState),
+    },
+  };
+
+  try {
+    let result = await runClaudeStreaming({ ...runOpts, resume: entry.started });
+
+    // --resume against a session the CLI has forgotten: reset and retry fresh.
+    if (entry.started && result.is_error && /no conversation found/i.test(result.text)) {
+      console.log(`[matrix-cc-bot] session ${entry.sessionId} not found, starting fresh`);
+      entry.sessionId = crypto.randomUUID();
+      entry.started = false;
       saveEntry(threadId, entry);
-    } catch (err) {
-      if (previewState.timer) clearTimeout(previewState.timer);
-      if (previewState.msg) {
-        await previewState.msg.edit(`Error: ${(err as Error).message}`).catch(() => {});
-      } else {
-        await message.reply(`Error: ${(err as Error).message}`);
-      }
-    } finally {
-      for (const p of filePaths) fs.unlink(p, () => {});
+      result = await runClaudeStreaming({ ...runOpts, sessionId: entry.sessionId, resume: false });
     }
+
+    recordSpend(roomId, result.costUsd);
+    if (previewState.timer) clearTimeout(previewState.timer);
+
+    const askDenial = result.permissionDenials?.find((d) => d.tool_name === "AskUserQuestion");
+    if (askDenial) {
+      await previewState.msg!.delete().catch(() => {});
+      entry.started = true;
+      await sendAskPrompt(room, threadId, entry, askDenial);
+      return;
+    }
+
+    // The model declined to speak. In a room where agents hear each other,
+    // silence is what ends an exchange gracefully; the budget is the other way.
+    if (result.text.trim().startsWith(SILENT_TOKEN)) {
+      await previewState.msg!.delete().catch(() => {});
+      entry.started = true;
+      saveEntry(threadId, entry);
+      console.log(`[matrix-cc-bot] ${SILENT_TOKEN} in ${threadId} — nothing posted`);
+      return;
+    }
+
+    entry.started = true;
+
+    let botReply: Msg;
+    try {
+      await previewState.msg!.delete().catch(() => {});
+      if (result.text.length <= MATRIX_MAX_LEN) {
+        botReply = replyTo ? await replyTo.reply(result.text) : await room.send(result.text);
+      } else {
+        botReply = await sendChunked(room, result.text, replyTo);
+      }
+    } catch (replyErr) {
+      console.error("[matrix-cc-bot] reply failed, trying fallback:", (replyErr as Error).message);
+      botReply = await room.send(result.text.slice(0, MATRIX_MAX_LEN));
+    }
+
+    entry.lastBotMessageId = botReply.id;
+    saveEntry(threadId, entry);
   } catch (err) {
-    console.error("[discord-cc-bot] handler error:", (err as Error).message);
+    if (previewState.timer) clearTimeout(previewState.timer);
+    if (previewState.msg) await previewState.msg.edit(`Error: ${(err as Error).message}`).catch(() => {});
+    else await room.send(`Error: ${(err as Error).message}`).catch(() => {});
+  } finally {
+    await transport.setTyping(roomId, false);
+    for (const p of opts.filePaths ?? []) fs.unlink(p, () => {});
+  }
+}
+
+// --- Message handler ---
+
+/** Push each room's human list into the transport, so isHuman is answerable. */
+function applyRoomHumans(): void {
+  for (const [roomId, cfg] of Object.entries(channelConfig.channels)) {
+    transport.setHumans(roomId, cfg.humans ?? channelConfig.defaultHumans ?? []);
+  }
+}
+
+transport.onMessage(async (msg) => {
+  let releaseTurn: (() => void) | null = null;
+  try {
+    const agent = getChannelAgent(msg.roomId);
+
+    // Matrix has no bot flag, so "from a sibling" is "not on the human list".
+    const fromBot = !msg.isHuman;
+    if (fromBot && !(agent?.allowBots ?? false)) return;
+
+    const isMentioned = msg.mentionsUs || matchesMentionPatterns(msg.content, agent);
+
+    if (agent) {
+      if ((agent.requireMention ?? false) && !isMentioned) return;
+    } else if (isMentioned) {
+      // A mention in a room with no config. Whether that is a feature or a hole
+      // in a boundary depends on the deployment, so it is a setting.
+      if (channelConfig.configuredChannelsOnly) {
+        console.log(`[matrix-cc-bot] mention in unconfigured room ${msg.roomId} — ignored (configuredChannelsOnly)`);
+        return;
+      }
+    } else {
+      return;
+    }
+
+    const room = transport.room(msg.roomId);
+
+    // Commands are free: no turn, no spend, no budget.
+    if (msg.isHuman && msg.content.trim().startsWith("!")) {
+      if (await handleCommand(msg, room)) return;
+    }
+
+    if (!consumeBotTurnBudget(msg.roomId, fromBot, agent)) return;
+
+    const budget = overDailyBudget(msg.roomId, agent);
+    if (budget.over) {
+      console.log(`[matrix-cc-bot] daily budget spent in ${msg.roomId}: $${budget.spent.toFixed(2)} of $${budget.cap.toFixed(2)}`);
+      if (budget.announce) {
+        await room.send(`💸 *Daily budget reached ($${budget.spent.toFixed(2)} of $${budget.cap.toFixed(2)}). Quiet until UTC midnight.*`).catch(() => {});
+      }
+      return;
+    }
+
+    const content = msg.content.trim();
+    if (!content && msg.attachments.length === 0) return;
+
+    const threadId = sessionKey(msg.roomId, agent);
+    const agentCwd = agent?.workingDirectory ?? channelConfig.defaults?.workingDirectory ?? DEFAULT_CWD;
+    const agentModel = agent?.model ?? channelConfig.defaults?.model ?? "opus";
+
+    const entry = agent
+      ? getOrCreate(threadMap, threadId, agentCwd, agent.sessionId)
+      : getOrCreate(threadMap, threadId, DEFAULT_CWD);
+    if (agent) { entry.cwd = agentCwd; entry.model = agentModel; }
+
+    releaseTurn = await acquireTurn(entry.sessionId);
+    if (!releaseTurn) {
+      console.log(`[matrix-cc-bot] queue full for ${entry.sessionId} — dropping message ${msg.id}`);
+      return;
+    }
+
+    // mxc:// is authenticated media, unlike a Discord CDN URL, so this goes
+    // through the client rather than a bare fetch.
+    const filePaths: string[] = [];
+    for (const att of msg.attachments) {
+      if (att.size > ATTACH_MAX_BYTES) {
+        console.log(`[matrix-cc-bot] skipping oversized attachment: ${att.name} (${att.size} bytes)`);
+        continue;
+      }
+      const ext = att.name.split(".").pop() ?? "bin";
+      const filepath = path.join(ATTACH_TMP_DIR, `${msg.id.replace(/[^\w]/g, "")}.${ext}`);
+      try {
+        await transport.downloadMedia(att.mxc, filepath);
+        filePaths.push(filepath);
+      } catch (err) {
+        console.error(`[matrix-cc-bot] attachment download failed: ${(err as Error).message}`);
+      }
+    }
+
+    const history = (agent?.fetchHistory ?? true)
+      ? await fetchThreadHistory(msg.roomId, entry, transport.getUserId(), msg.id)
+      : "";
+
+    // Once several speakers share a room the model has no other way to tell who
+    // is talking, and who is talking is the whole of the routing. Only Terry's
+    // word is Terry's, and this label is how that stays checkable.
+    const body = (agent?.allowBots ?? false) ? `[${msg.senderName}] ${content}` : content;
+    let userMessage = body;
+    if (filePaths.length === 1) {
+      userMessage = `${body}\n\nThe user attached a file: ${filePaths[0]}`.trim();
+    } else if (filePaths.length > 1) {
+      userMessage = `${body}\n\nThe user attached files:\n${filePaths.map((p) => `- ${p}`).join("\n")}`.trim();
+    }
+
+    await runTurn({
+      room,
+      roomId: msg.roomId,
+      threadId,
+      entry,
+      agent,
+      prompt: history ? `${history}${userMessage}` : userMessage,
+      replyTo: transport.msg(msg.roomId, msg.id),
+      filePaths,
+    });
+  } catch (err) {
+    console.error("[matrix-cc-bot] handler error:", (err as Error).message);
   } finally {
     releaseTurn?.();
   }
 });
 
+// --- Start ---
+
 function shutdown() {
   for (const child of running.values()) child.kill("SIGTERM");
   db.close();
-  client.destroy();
+  transport.client.stop();
   process.exit(0);
 }
 
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 
-client.login(DISCORD_TOKEN);
+(async () => {
+  const { userId, displayName } = await transport.start();
+  console.log(`[matrix-cc-bot] ready as ${userId} ("${displayName}") on ${HOMESERVER_URL}`);
+  console.log(
+    `[matrix-cc-bot] auth: ${hasStoredCredentials()
+      ? `stored credentials (${CREDENTIALS_PATH}); CLAUDE_CODE_OAUTH_TOKEN blanked for children`
+      : process.env.CLAUDE_CODE_OAUTH_TOKEN
+        ? "CLAUDE_CODE_OAUTH_TOKEN from the environment"
+        : "none found — the CLI will resolve its own"}`,
+  );
+
+  applyRoomHumans();
+  const configured = Object.entries(channelConfig.channels);
+  console.log(
+    configured.length
+      ? `[matrix-cc-bot] ${configured.length} room(s): ` + configured
+          .map(([rid, c]) => `${c.name}=${rid}${c.sessionGroup ? ` group:${c.sessionGroup}` : ""}${c.requireMention ? " mention" : ""}${c.allowBots ? " bots" : ""}${c.fetchHistory === false ? " nohistory" : ""}${c.disallowedTools?.length ? ` -${c.disallowedTools.length}tools` : ""}`)
+          .join(", ")
+      : "[matrix-cc-bot] no channel-config.json — mention-only with defaults",
+  );
+  console.log(`[matrix-cc-bot] unconfigured rooms: ${channelConfig.configuredChannelsOnly ? "ignored" : "answer on mention with defaults"}`);
+  console.log(`[matrix-cc-bot] backfill: events before startup are dropped`);
+
+  startScheduledJobs();
+})().catch((err) => {
+  console.error("[matrix-cc-bot] startup failed:", err);
+  process.exit(1);
+});
